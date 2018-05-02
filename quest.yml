@@ -1,0 +1,40 @@
+server:
+  listens:
+    - TCP: :7053
+    - UDP: :7053
+  cache_size: 1000
+
+resolvers:
+  china:
+    server:
+      - 223.5.5.5
+      - 223.6.6.6
+
+  non-china:
+    server:
+      # - address: 8.8.8.8
+      #   mode: tcp
+      - address: 1.1.1.1
+        mode: dns-over-tls
+        hostname: cloudflare-dns.com
+      - address: 1.0.0.1
+        mode: dns-over-tls
+        hostname: cloudflare-dns.com
+
+routes:
+  main:
+    - {ROUTE: CHINA_SITES}
+    - {ROUTE: non-china}
+
+  CHINA_SITES:
+    - {DOMAIN-SUFFIX: cn, ROUTE: china}
+    - {DOMAIN-SUFFIX: baidu.com, ROUTE: china}
+    - {DOMAIN-SUFFIX: bilibili.com, ROUTE: china}
+    - {DOMAIN-SUFFIX: t.tt, ROUTE: china}
+
+  china:
+    - {IPSET: china}
+    - {RESOLVER: china}
+
+  non-china:
+    - {RESOLVER: non-china}
