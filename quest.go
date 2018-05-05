@@ -1,10 +1,8 @@
 package main
 
 /*
-	TODO tcp connection pooling
-	TODO better logging format:
-		 2018/04/21 21:39:02 123 172.16.21.245:55632 udp <=> 1.1.1.1:53 tcp-tls t.co A 123ms
 	TODO cache
+	TODO resolver configuration (pooling, retry, timeout etc.)
 */
 
 import (
@@ -49,9 +47,9 @@ type questServer struct {
 		addr string
 		net  string
 	}
-	cacheSize int
-	resolvers map[string]questResolver
-	routes    map[string]*questRouteTable
+	cacheSize      int
+	namedResolvers map[string][]*Resolver
+	routes         map[string]*questRouteTable
 
 	t       tomb.Tomb
 	servers []dns.Server
@@ -68,21 +66,21 @@ func newServer(configPath string) (server *questServer, err error) {
 		return
 	}
 
-	resolvers, err := buildResolvers(config.Resolvers)
+	namedResolvers, err := buildResolvers(config.Resolvers)
 	if err != nil {
 		return
 	}
 
-	routes, err := buildRoutes(config.Routes, resolvers)
+	routes, err := buildRoutes(config.Routes, namedResolvers)
 	if err != nil {
 		return
 	}
 
 	server = &questServer{
-		listens:   listens,
-		cacheSize: config.Server.CacheSize,
-		resolvers: resolvers,
-		routes:    routes,
+		listens:        listens,
+		cacheSize:      config.Server.CacheSize,
+		namedResolvers: namedResolvers,
+		routes:         routes,
 	}
 
 	return
@@ -118,63 +116,87 @@ func (s *questServer) Shutdown() error {
 	return s.t.Wait()
 }
 
-func (s *questServer) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
-	if len(r.Question) == 0 {
+func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
+	go s.resolve(w, m)
+}
+
+func (s *questServer) resolve(w dns.ResponseWriter, m *dns.Msg) {
+	if len(m.Question) == 0 {
+		log.Printf("[%05d] empty query", m.Id)
 		return
 	}
 
-	q := r.Question[0]
+	q := m.Question[0]
+	var resolvers []*Resolver
+	resolvers, postActions := s.routes["main"].Route(q.Name)
+	if resolvers == nil {
+		log.Printf("[%05d] %s %s could not found a suitable resolver", m.Id, q.Name, dns.Type(q.Qtype).String())
+		r := m.Copy()
+		r.MsgHdr.Rcode = dns.RcodeServerFailure
+		w.WriteMsg(r)
+		return
+	}
+	type Result struct {
+		resolver *Resolver
+		msg      *dns.Msg
+		rtt      time.Duration
+		err      error
+	}
+	results := make(chan *Result)
 
-	go func() {
-		for i := 0; i < 3; i++ {
-			resp, err := s.resolve(r)
+	for _, resolver := range resolvers {
+		go func(resolver *Resolver) {
+			msgCopy := m.Copy()
+			msgCopy.Id = dns.Id()
+			r, rtt, err := resolver.Resolve(msgCopy)
 			if err != nil {
-				log.Printf("[%05d] %s %s retring by %s\n",
-					r.Id, q.Name, dns.Type(q.Qtype).String(), err)
-				continue
+				log.Printf("[%05d] failed to send message to %s: %s", m.Id, resolver.address, err)
+				r = msgCopy
+				r.MsgHdr.Rcode = dns.RcodeServerFailure
 			}
-			err = w.WriteMsg(resp)
-			if err != nil {
-				log.Printf("[%05d] %s %s err respond: %s\n",
-					r.Id, q.Name, dns.Type(q.Qtype).String(), err)
-				return
-			}
+			r.Id = m.Id
+			results <- &Result{resolver, r, rtt, err}
+		}(resolver)
+	}
+	var result *Result
+	for i := len(resolvers); i != 0; i-- {
+		result = <-results
+		if result.err == nil {
 			break
 		}
-	}()
-}
-
-func (s *questServer) resolve(r *dns.Msg) (*dns.Msg, error) {
-	q := r.Question[0]
-	resolver, postActions := s.routes["main"].Route(q.Name)
-	if resolver != nil {
-		resp, err := resolver.Resolve(r)
-		if err != nil {
-			err := fmt.Errorf("err resolve: %s", err)
-			return nil, err
-		}
-		if resp == nil {
-			err := fmt.Errorf("err resolve: no respond")
-			return nil, err
-		}
-		for _, action := range postActions {
-			err := action.Do(resp)
-			if err != nil {
-				log.Printf("[%05d] %s %s err action: %#v %s\n",
-					r.Id, q.Name, dns.Type(q.Qtype).String(), action, err)
-			}
-		}
-		return resp, nil
 	}
-	err := fmt.Errorf("err route: could not found a suitable resolver")
-	return nil, err
+	question := m.Question[0]
+	resolver := result.resolver
+	log.Printf(
+		"[%05d] %s %s %s -> %s %s %s\n",
+		m.Id,
+		question.Name,
+		dns.Type(question.Qtype).String(),
+		w.RemoteAddr(),
+		resolver.address,
+		resolver.client.Net,
+		result.rtt.Round(time.Millisecond),
+	)
+
+	for _, action := range postActions {
+		action.Do(result.msg)
+	}
+
+	err := w.WriteMsg(result.msg)
+	if err != nil {
+		log.Printf(
+			"[%05d] cannot send answer to client %s\n",
+			m.Id,
+			err,
+		)
+	}
 }
 
-func buildResolvers(configs map[string]ConfigResolver) (resolvers map[string]questResolver, err error) {
-	resolvers = make(map[string]questResolver)
+func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[string][]*Resolver, err error) {
+	namedResolvers = make(map[string][]*Resolver)
 
 	for name, config := range configs {
-		resolverGroup := &questResolverGroup{name: name, resolvers: make([]*normalResolver, 0)}
+		resolvers := make([]*Resolver, 0)
 		for _, rawServerConfig := range config.Server {
 			serverConfig, ok := rawServerConfig.(map[interface{}]interface{})
 			if !ok {
@@ -188,7 +210,7 @@ func buildResolvers(configs map[string]ConfigResolver) (resolvers map[string]que
 				}
 			}
 
-			var r *normalResolver
+			var r *Resolver
 			var address string
 			if i, ok := serverConfig["address"]; !ok {
 				err = fmt.Errorf("Invalid config: address are required at resolver '%s'", name)
@@ -202,24 +224,23 @@ func buildResolvers(configs map[string]ConfigResolver) (resolvers map[string]que
 				mode, _ = i.(string)
 			}
 
-			var client Client
 			switch mode {
 			case "tcp":
 				address = withDefaultPort(address, "53")
-				var addr *net.TCPAddr
-				addr, err = net.ResolveTCPAddr("tcp", address)
+				_, err = net.ResolveTCPAddr("tcp", address)
 				if err != nil {
 					return
 				}
-				client = NewTCPClient(addr)
+				c := &dns.Client{Net: "tcp"}
+				r = newResolver(address, c, nil)
 			case "udp":
 				address = withDefaultPort(address, "53")
-				var addr *net.UDPAddr
-				addr, err = net.ResolveUDPAddr("udp", address)
+				_, err = net.ResolveUDPAddr("udp", address)
 				if err != nil {
 					return
 				}
-				client = NewUDPClient(addr)
+				c := &dns.Client{Net: "udp"}
+				r = newResolver(address, c, nil)
 			case "dns-over-tls":
 				address = withDefaultPort(address, "853")
 				var hostname string
@@ -232,84 +253,24 @@ func buildResolvers(configs map[string]ConfigResolver) (resolvers map[string]que
 				}
 				tlsConfig := DefaultTLSConfig()
 				tlsConfig.ServerName = hostname
-				var addr *net.TCPAddr
-				addr, err = net.ResolveTCPAddr("tcp", address)
+				_, err = net.ResolveTCPAddr("tcp", address)
 				if err != nil {
 					return
 				}
-				client = NewTLSClient(addr, tlsConfig)
+				c := &dns.Client{Net: "tcp-tls", TLSConfig: DefaultTLSConfig()}
+				r = newResolver(address, c, nil)
 			default:
 				err = fmt.Errorf("Invalid config: invalid mode at resolver '%s'", name)
 				return
 			}
-
-			r = &normalResolver{client: client, address: address}
-			resolverGroup.resolvers = append(resolverGroup.resolvers, r)
+			resolvers = append(resolvers, r)
 		}
-		resolvers[name] = resolverGroup
+		namedResolvers[name] = resolvers
 	}
 	return
 }
 
-type normalResolver struct {
-	client  Client
-	address string
-}
-
-func (r *normalResolver) Resolve(msg *dns.Msg) (*dns.Msg, time.Duration, error) {
-	return r.client.Exchange(msg)
-}
-
-type questResolverGroup struct {
-	name      string
-	resolvers []*normalResolver
-}
-
-func (r *questResolverGroup) Resolve(msg *dns.Msg) (*dns.Msg, error) {
-	type Result struct {
-		resolver *normalResolver
-		msg      *dns.Msg
-		rtt      time.Duration
-		err      error
-	}
-	results := make(chan Result)
-	defer close(results)
-
-	for _, r := range r.resolvers {
-		go func(r *normalResolver) {
-			rmsg, rtt, err := r.Resolve(msg)
-			func() {
-				defer func() { recover() }()
-				results <- Result{r, rmsg, rtt, err}
-			}()
-		}(r)
-	}
-	var result Result
-	for i := len(r.resolvers); i != 0; i-- {
-		result = <-results
-		if result.err == nil {
-			break
-		}
-	}
-	question := msg.Question[0]
-	resolver := result.resolver
-	log.Printf(
-		"[%05d] %s %s -> %s(%s) %s\n",
-		msg.Id,
-		question.Name,
-		dns.Type(question.Qtype).String(),
-		resolver.client.Addr(),
-		resolver.client.Net(),
-		result.rtt.Round(time.Millisecond),
-	)
-	return result.msg, result.err
-}
-
-type questResolver interface {
-	Resolve(*dns.Msg) (*dns.Msg, error)
-}
-
-func buildRoutes(routesConfig map[string][]ConfigRoute, resolvers map[string]questResolver) (routes map[string]*questRouteTable, err error) {
+func buildRoutes(routesConfig map[string][]ConfigRoute, namedResolvers map[string][]*Resolver) (routes map[string]*questRouteTable, err error) {
 	routes = make(map[string]*questRouteTable)
 	for name := range routesConfig {
 		routes[name] = &questRouteTable{routes: make([]*questRoute, 0), name: name}
@@ -324,7 +285,7 @@ func buildRoutes(routesConfig map[string][]ConfigRoute, resolvers map[string]que
 				case "DOMAIN-SUFFIX":
 					r.rule = &questRuleDomainSuffix{suffix: fmt.Sprintf("%s.", param)}
 				case "ROUTE":
-					if r.resolver != nil {
+					if r.resolvers != nil {
 						err = fmt.Errorf("Invalid config: connot use ROUTE and RESOLVER at same route")
 						return
 					}
@@ -342,8 +303,8 @@ func buildRoutes(routesConfig map[string][]ConfigRoute, resolvers map[string]que
 						err = fmt.Errorf("Invalid config: connot use ROUTE and RESOLVER at same route")
 						return
 					}
-					if resolver, ok := resolvers[param]; ok {
-						r.resolver = resolver
+					if resolvers, ok := namedResolvers[param]; ok {
+						r.resolvers = resolvers
 					} else {
 						err = fmt.Errorf("Invalid config: unknown resolver '%s'", param)
 						return
@@ -400,13 +361,13 @@ type questRouteTable struct {
 	routes []*questRoute
 }
 
-func (r *questRouteTable) Route(domain string) (resolver questResolver, cumulatedPostActions []questPostAction) {
+func (r *questRouteTable) Route(domain string) (resolvers []*Resolver, cumulatedPostActions []questPostAction) {
 	cumulatedPostActions = make([]questPostAction, 0)
 	for _, route := range r.routes {
 		var postActions []questPostAction
-		resolver, postActions = route.Route(domain)
+		resolvers, postActions = route.Route(domain)
 		cumulatedPostActions = append(cumulatedPostActions, postActions...)
-		if resolver != nil {
+		if resolvers != nil {
 			return
 		}
 	}
@@ -417,10 +378,10 @@ type questRoute struct {
 	rule       questRule
 	table      *questRouteTable
 	postAction questPostAction
-	resolver   questResolver
+	resolvers  []*Resolver
 }
 
-func (r *questRoute) Route(domain string) (resolver questResolver, cumulatedPostActions []questPostAction) {
+func (r *questRoute) Route(domain string) (resolvers []*Resolver, cumulatedPostActions []questPostAction) {
 	cumulatedPostActions = make([]questPostAction, 0)
 	if r.rule.Match(domain) {
 		if r.postAction != nil {
@@ -428,12 +389,12 @@ func (r *questRoute) Route(domain string) (resolver questResolver, cumulatedPost
 		}
 		if r.table != nil {
 			var postActions []questPostAction
-			resolver, postActions = r.table.Route(domain)
+			resolvers, postActions = r.table.Route(domain)
 			cumulatedPostActions = append(cumulatedPostActions, postActions...)
 			return
 		}
-		if r.resolver != nil {
-			resolver = r.resolver
+		if r.resolvers != nil {
+			resolvers = r.resolvers
 			return
 		}
 	}
@@ -536,11 +497,16 @@ func withDefaultPort(address, defaultPort string) string {
 	return net.JoinHostPort(host, port)
 }
 
+var defaultTLSConfig *tls.Config
+
 // DefaultTLSConfig default tls config
 func DefaultTLSConfig() *tls.Config {
-	roots, err := x509.SystemCertPool()
-	if err != nil {
-		panic("Cannot get system CAs")
+	if defaultTLSConfig == nil {
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			panic("Cannot get system CAs")
+		}
+		defaultTLSConfig = &tls.Config{RootCAs: roots}
 	}
-	return &tls.Config{RootCAs: roots}
+	return defaultTLSConfig
 }
