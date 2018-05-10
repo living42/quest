@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -143,6 +144,9 @@ func (s *questServer) resolve(w dns.ResponseWriter, m *dns.Msg) {
 		err      error
 	}
 	results := make(chan *Result)
+	defer close(results)
+	wg := sync.WaitGroup{}
+	wg.Add(len(resolvers))
 
 	for _, resolver := range resolvers {
 		go func(resolver *Resolver) {
@@ -156,6 +160,7 @@ func (s *questServer) resolve(w dns.ResponseWriter, m *dns.Msg) {
 			}
 			r.Id = m.Id
 			results <- &Result{resolver, r, rtt, err}
+			wg.Done()
 		}(resolver)
 	}
 	var result *Result
@@ -190,6 +195,7 @@ func (s *questServer) resolve(w dns.ResponseWriter, m *dns.Msg) {
 			err,
 		)
 	}
+	wg.Wait()
 }
 
 func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[string][]*Resolver, err error) {
