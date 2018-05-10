@@ -21,6 +21,7 @@ type Resolver struct {
 type ResolverConfig struct {
 	maxIdleConn   int
 	maxRetryCount int
+	maxIdleTime   time.Duration
 }
 
 // DefaultResolverConfig default config
@@ -28,6 +29,7 @@ func DefaultResolverConfig() *ResolverConfig {
 	return &ResolverConfig{
 		maxIdleConn:   5,
 		maxRetryCount: 5,
+		maxIdleTime:   10 * time.Second,
 	}
 }
 
@@ -43,8 +45,8 @@ func newResolver(address string, c *dns.Client, config *ResolverConfig) *Resolve
 			address:     address,
 			c:           c,
 			idle:        list.New(),
-			active:      make(map[int]*Conn),
 			maxIdleConn: config.maxIdleConn,
+			maxIdleTime: config.maxIdleTime,
 		},
 	}
 }
@@ -64,10 +66,12 @@ func (c *Resolver) Resolve(m *dns.Msg) (r *dns.Msg, rtt time.Duration, err error
 		}
 		err = conn.WriteMsg(m)
 		if err != nil {
+			conn.Close()
 			continue
 		}
 		r, err = conn.ReadMsg()
 		if err != nil {
+			conn.Close()
 			continue
 		}
 		c.pool.Add(conn)
@@ -81,8 +85,8 @@ type connectionPool struct {
 	address     string
 	c           *dns.Client
 	idle        *list.List
-	active      map[int]*Conn
 	maxIdleConn int
+	maxIdleTime time.Duration
 	mu          sync.Mutex
 }
 
@@ -105,13 +109,10 @@ func (p *connectionPool) Get() (c *Conn, err error) {
 	if err != nil {
 		return
 	}
-	p.mu.Lock()
-	p.active[id] = c
-	p.mu.Unlock()
 	return
 }
 
-func (p *connectionPool) getIdleConn() (c *Conn) {
+func (p *connectionPool) getIdleConn() *Conn {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -119,26 +120,22 @@ func (p *connectionPool) getIdleConn() (c *Conn) {
 	for p.idle.Len() > 0 {
 		e := p.idle.Front()
 		p.idle.Remove(e)
-		c = e.Value.(*Conn)
-		if now.Sub(c.created) > 10*time.Second {
+		c := e.Value.(*Conn)
+		if now.Sub(c.created) > p.maxIdleTime {
 			c.Close()
 			continue
 		}
-		p.active[c.id] = c
-		return
+		return c
 	}
-	return
+	return nil
 }
 
 func (p *connectionPool) Add(c *Conn) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, ok := p.active[c.id]; ok {
-		delete(p.active, c.id)
-		if p.idle.Len() < p.maxIdleConn {
-			p.idle.PushBack(c)
-		} else {
-			c.Close()
-		}
+	if p.idle.Len() < p.maxIdleConn {
+		p.idle.PushBack(c)
+	} else {
+		c.Close()
 	}
 }
