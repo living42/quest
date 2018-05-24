@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -16,11 +17,7 @@ func testResolve(resolver *Resolver, t *testing.T) {
 				m := &dns.Msg{}
 				m.SetQuestion("t.co.", dns.TypeA)
 				m.Id = dns.Id()
-				_, rtt, err := resolver.Resolve(m)
-				t.Logf(
-					"after: rtt: %s idle: %d active: %d\n",
-					rtt.Round(time.Millisecond), resolver.pool.idle.Len(), len(resolver.pool.active),
-				)
+				_, _, err := resolver.Resolve(context.Background(), m)
 				if err != nil {
 					t.Error(err)
 				}

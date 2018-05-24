@@ -1,7 +1,10 @@
 package main
 
 import (
-	"container/list"
+	"context"
+	"fmt"
+	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -12,9 +15,10 @@ import (
 type Resolver struct {
 	address string
 	client  *dns.Client
-	pool    *connectionPool
 	connsMu sync.Mutex
-	config  *ResolverConfig
+	config  ResolverConfig
+	idles   []*conn
+	idleMu  sync.Mutex
 }
 
 // ResolverConfig config
@@ -27,9 +31,9 @@ type ResolverConfig struct {
 // DefaultResolverConfig default config
 func DefaultResolverConfig() *ResolverConfig {
 	return &ResolverConfig{
-		maxIdleConn:   5,
+		maxIdleConn:   2,
 		maxRetryCount: 5,
-		maxIdleTime:   10 * time.Second,
+		maxIdleTime:   30 * time.Second,
 	}
 }
 
@@ -40,102 +44,161 @@ func newResolver(address string, c *dns.Client, config *ResolverConfig) *Resolve
 	return &Resolver{
 		address: address,
 		client:  c,
-		config:  config,
-		pool: &connectionPool{
-			address:     address,
-			c:           c,
-			idle:        list.New(),
-			maxIdleConn: config.maxIdleConn,
-			maxIdleTime: config.maxIdleTime,
-		},
+		config:  *config,
+		idles:   make([]*conn, 0),
 	}
 }
 
 // Resolve resolver
-func (c *Resolver) Resolve(m *dns.Msg) (r *dns.Msg, rtt time.Duration, err error) {
+func (c *Resolver) Resolve(ctx context.Context, m *dns.Msg) (r *dns.Msg, rtt time.Duration, err error) {
 	start := time.Now()
-	defer func() {
-		rtt = time.Now().Sub(start)
-	}()
+	defer func() { rtt = time.Now().Sub(start) }()
 
-	for i := 0; i < c.config.maxRetryCount; i++ {
-		var conn *Conn
-		conn, err = c.pool.Get()
+	retryCount := 0
+	var co *conn
+	for ; retryCount < c.config.maxRetryCount; retryCount++ {
+		co, err = c.getConn()
 		if err != nil {
 			continue
 		}
-		err = conn.WriteMsg(m)
+		log.Printf("open %s - %s\n", co.LocalAddr(), co.RemoteAddr())
+		err = co.writeReq(m)
 		if err != nil {
-			conn.Close()
 			continue
 		}
-		r, err = conn.ReadMsg()
-		if err != nil {
-			conn.Close()
-			continue
+
+		select {
+		case <-ctx.Done():
+			r = nil
+			err = nil
+			return
+		case res := <-co.resCh:
+			if res == nil {
+				continue
+			}
+			r = res.r
+			err = res.err
+			if err != nil {
+				continue
+			}
+			return
 		}
-		c.pool.Add(conn)
-		return
+	}
+	if retryCount > c.config.maxRetryCount {
+		err = fmt.Errorf("max retry exceeded: %s", err)
 	}
 	return
 }
 
-type connectionPool struct {
-	counter     int
-	address     string
-	c           *dns.Client
-	idle        *list.List
-	maxIdleConn int
-	maxIdleTime time.Duration
-	mu          sync.Mutex
-}
-
-// Conn conn
-type Conn struct {
-	*dns.Conn
-	id      int
-	created time.Time
-}
-
-func (p *connectionPool) Get() (c *Conn, err error) {
-	c = p.getIdleConn()
-	if c != nil {
-		return
+func (c *Resolver) getConn() (*conn, error) {
+	co := c.getIdleConn()
+	if co != nil {
+		log.Printf("use idle conn %s - %s\n", co.LocalAddr(), co.RemoteAddr())
+		return co, nil
 	}
-	p.counter++
-	id := p.counter
-	dnsConn, err := p.c.Dial(p.address)
-	c = &Conn{Conn: dnsConn, id: id, created: time.Now()}
+
+	dc, err := c.client.Dial(c.address)
 	if err != nil {
-		return
+		return nil, err
 	}
-	return
+	co = &conn{Conn: dc, resCh: make(chan *result), r: c}
+	go co.readloop()
+	return co, nil
 }
 
-func (p *connectionPool) getIdleConn() *Conn {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	now := time.Now()
-
-	for p.idle.Len() > 0 {
-		e := p.idle.Front()
-		p.idle.Remove(e)
-		c := e.Value.(*Conn)
-		if now.Sub(c.created) > p.maxIdleTime {
-			c.Close()
-			continue
-		}
-		return c
+func (c *Resolver) getIdleConn() *conn {
+	c.idleMu.Lock()
+	defer c.idleMu.Unlock()
+	if len(c.idles) > 0 {
+		co := c.idles[0]
+		c.idles = c.idles[1:]
+		return co
 	}
 	return nil
 }
 
-func (p *connectionPool) Add(c *Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.idle.Len() < p.maxIdleConn {
-		p.idle.PushBack(c)
-	} else {
-		c.Close()
+type conn struct {
+	*dns.Conn
+	resCh chan *result
+	r     *Resolver
+}
+
+type result struct {
+	r   *dns.Msg
+	err error
+}
+
+func (c *conn) writeReq(m *dns.Msg) error {
+	err := c.WriteMsg(m)
+	if err != nil {
+		return err
 	}
+	c.SetReadDeadline(time.Now().Add(15 * time.Second))
+	return nil
+}
+
+func (c *conn) readloop() {
+	defer func() {
+		c.Close()
+		close(c.resCh)
+		c.r.removeIdle(c)
+		log.Printf("close %s - %s\n", c.LocalAddr(), c.RemoteAddr())
+	}()
+
+	start := time.Now()
+
+	for {
+		c.SetReadDeadline(time.Now().Add(15 * time.Second))
+		r, err := c.ReadMsg()
+		c.SetReadDeadline(time.Time{})
+		select {
+		case c.resCh <- &result{r: r, err: err}:
+		default:
+		}
+		if err != nil {
+			if netErr, ok := err.(*net.OpError); !ok || netErr.Timeout() {
+				return
+			}
+		}
+		if time.Now().Sub(start) > c.r.config.maxIdleTime {
+			return
+		}
+		if !c.r.putIdle(c) {
+			return
+		}
+		log.Printf("put idle conn %s - %s\n", c.LocalAddr(), c.RemoteAddr())
+	}
+}
+
+func (c *Resolver) putIdle(co *conn) bool {
+	c.idleMu.Lock()
+	defer c.idleMu.Unlock()
+	if len(c.idles) >= c.config.maxIdleConn {
+		return false
+	}
+	c.idles = append(c.idles, co)
+	return true
+}
+
+func (c *Resolver) removeIdle(co *conn) bool {
+	c.idleMu.Lock()
+	defer c.idleMu.Unlock()
+	switch len(c.idles) {
+	case 0:
+		return false
+	case 1:
+		if c.idles[0] == co {
+			c.idles = c.idles[1:]
+			return true
+		}
+	default:
+		for i, v := range c.idles {
+			if v != co {
+				continue
+			}
+			c.idles = append(c.idles[:i], c.idles[i+1:]...)
+			return true
+		}
+	}
+	return false
 }

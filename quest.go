@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
@@ -118,10 +119,9 @@ func (s *questServer) Shutdown() error {
 }
 
 func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
-	go s.resolve(w, m)
-}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-func (s *questServer) resolve(w dns.ResponseWriter, m *dns.Msg) {
 	if len(m.Question) == 0 {
 		log.Printf("[%05d] empty query", m.Id)
 		return
@@ -143,24 +143,31 @@ func (s *questServer) resolve(w dns.ResponseWriter, m *dns.Msg) {
 		rtt      time.Duration
 		err      error
 	}
-	results := make(chan *Result)
+	results := make(chan *Result, len(resolvers))
 	defer close(results)
 	wg := sync.WaitGroup{}
 	wg.Add(len(resolvers))
+	defer wg.Wait()
 
 	for _, resolver := range resolvers {
 		go func(resolver *Resolver) {
+			defer wg.Done()
 			msgCopy := m.Copy()
 			msgCopy.Id = dns.Id()
-			r, rtt, err := resolver.Resolve(msgCopy)
+			log.Printf("send query to %s\n", resolver.address)
+			r, rtt, err := resolver.Resolve(ctx, msgCopy)
 			if err != nil {
-				log.Printf("[%05d] failed to send message to %s: %s", m.Id, resolver.address, err)
+				log.Printf("[%05d] failed to send message to %s: %s\n", m.Id, resolver.address, err)
 				r = msgCopy
 				r.MsgHdr.Rcode = dns.RcodeServerFailure
 			}
+			if r == nil {
+				// canceled
+				log.Printf("%s canceled\n", resolver.address)
+				return
+			}
 			r.Id = m.Id
 			results <- &Result{resolver, r, rtt, err}
-			wg.Done()
 		}(resolver)
 	}
 	var result *Result
@@ -195,7 +202,6 @@ func (s *questServer) resolve(w dns.ResponseWriter, m *dns.Msg) {
 			err,
 		)
 	}
-	wg.Wait()
 }
 
 func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[string][]*Resolver, err error) {
@@ -349,15 +355,23 @@ func (a *ipsetAction) Do(msg *dns.Msg) error {
 		default:
 			continue
 		}
-		cmd := exec.Command("ipset", "add", a.setName, ip)
-		out, err := cmd.CombinedOutput()
+		err := a.ipsetAdd(ip)
 		if err != nil {
-			if bytes.Contains(out, []byte("already added")) {
-				return nil
-			}
-			err = fmt.Errorf("ipset %s: %s", err, out)
 			return err
 		}
+	}
+	return nil
+}
+
+func (a *ipsetAction) ipsetAdd(ip string) error {
+	cmd := exec.Command("ipset", "add", a.setName, ip)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if bytes.Contains(out, []byte("already added")) {
+			return nil
+		}
+		err = fmt.Errorf("ipset %s: %s", err, out)
+		return err
 	}
 	return nil
 }
