@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -263,13 +262,11 @@ func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[strin
 					err = fmt.Errorf("Invalid config: hostname must be a string at resolver '%s'", name)
 					return
 				}
-				tlsConfig := DefaultTLSConfig()
-				tlsConfig.ServerName = hostname
 				_, err = net.ResolveTCPAddr("tcp", address)
 				if err != nil {
 					return
 				}
-				c := &dns.Client{Net: "tcp-tls", TLSConfig: DefaultTLSConfig()}
+				c := &dns.Client{Net: "tcp-tls", TLSConfig: &tls.Config{ServerName: hostname}}
 				r = newResolver(address, c, nil)
 			default:
 				err = fmt.Errorf("Invalid config: invalid mode at resolver '%s'", name)
@@ -515,18 +512,4 @@ func withDefaultPort(address, defaultPort string) string {
 		host, port = address, defaultPort
 	}
 	return net.JoinHostPort(host, port)
-}
-
-var defaultTLSConfig *tls.Config
-
-// DefaultTLSConfig default tls config
-func DefaultTLSConfig() *tls.Config {
-	if defaultTLSConfig == nil {
-		roots, err := x509.SystemCertPool()
-		if err != nil {
-			panic("Cannot get system CAs")
-		}
-		defaultTLSConfig = &tls.Config{RootCAs: roots}
-	}
-	return defaultTLSConfig
 }

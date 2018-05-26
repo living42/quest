@@ -29,7 +29,7 @@ func testResolve(resolver *Resolver, t *testing.T) {
 }
 
 func TestResolveViaTLS(t *testing.T) {
-	c := &dns.Client{Net: "tcp-tls", TLSConfig: DefaultTLSConfig()}
+	c := &dns.Client{Net: "tcp-tls"}
 	resolver := newResolver("1.1.1.1:853", c, nil)
 	testResolve(resolver, t)
 }
