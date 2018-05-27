@@ -1,8 +1,8 @@
 package main
 
 /*
-	TODO cache
 	TODO resolver configuration (pooling, retry, timeout etc.)
+	TODO respond ahead of query
 */
 
 import (
@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bluele/gcache"
 	"github.com/miekg/dns"
 	"gopkg.in/tomb.v2"
 	"gopkg.in/yaml.v2"
@@ -48,7 +49,7 @@ type questServer struct {
 		addr string
 		net  string
 	}
-	cacheSize      int
+	cache          gcache.Cache
 	namedResolvers map[string][]*Resolver
 	routes         map[string]*questRouteTable
 
@@ -79,12 +80,38 @@ func newServer(configPath string) (server *questServer, err error) {
 
 	server = &questServer{
 		listens:        listens,
-		cacheSize:      config.Server.CacheSize,
 		namedResolvers: namedResolvers,
 		routes:         routes,
 	}
+	server.cache = server.newCache(config.Server.CacheSize)
 
 	return
+}
+
+func (s *questServer) newCache(cacheSize int) gcache.Cache {
+	return gcache.New(cacheSize).ARC().LoaderExpireFunc(s.loaderExpireFunc).Build()
+}
+
+func (s *questServer) loaderExpireFunc(key interface{}) (interface{}, *time.Duration, error) {
+	q := key.(dns.Question)
+	result, err := s.query(q)
+	if err != nil {
+		return nil, nil, err
+	}
+	var ttl time.Duration
+	if len(result.msg.Answer) == 0 {
+		ttl = 5 * time.Second
+	} else {
+		a := result.msg.Answer[0]
+		ttl = time.Duration(a.Header().Ttl) * time.Second
+		for _, a = range result.msg.Answer {
+			if a.Header().Rrtype == q.Qtype {
+				ttl = time.Duration(a.Header().Ttl) * time.Second
+				break
+			}
+		}
+	}
+	return result, &ttl, nil
 }
 
 func (s *questServer) Serve() error {
@@ -118,31 +145,72 @@ func (s *questServer) Shutdown() error {
 }
 
 func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	if len(m.Question) == 0 {
 		log.Printf("[%05d] empty query", m.Id)
 		return
 	}
 
+	start := time.Now()
 	q := m.Question[0]
+	v, err := s.cache.Get(q)
+
+	var r *dns.Msg
+	if err != nil {
+		log.Printf("[%05d] %s %s query err %s", m.Id, q.Name, dns.Type(q.Qtype).String(), err)
+		r = m.Copy()
+		r.MsgHdr.Rcode = dns.RcodeServerFailure
+	} else {
+		result := v.(*queryResult)
+		r = result.msg.Copy()
+		r.Id = m.Id
+		now := time.Now()
+		for _, a := range r.Answer {
+			span := now.Sub(result.resolvedAt).Seconds()
+			ttl := a.Header().Ttl
+			if span > float64(ttl) {
+				ttl = 0
+			} else {
+				ttl -= uint32(span)
+			}
+			a.Header().Ttl = ttl
+		}
+		question := m.Question[0]
+		resolver := result.resolver
+		rtt := time.Now().Sub(start)
+		log.Printf(
+			"[%05d] %s %s %s -> %s %s %s\n",
+			m.Id,
+			question.Name,
+			dns.Type(question.Qtype).String(),
+			w.RemoteAddr(),
+			resolver.address,
+			resolver.client.Net,
+			rtt.Round(time.Millisecond),
+		)
+	}
+
+	err = w.WriteMsg(r)
+	if err != nil {
+		log.Printf("[%05d] %s %s respond err %s", m.Id, q.Name, dns.Type(q.Qtype).String(), err)
+	}
+}
+
+func (s *questServer) query(q dns.Question) (*queryResult, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	var resolvers []*Resolver
 	resolvers, postActions := s.routes["main"].Route(q.Name)
 	if resolvers == nil {
-		log.Printf("[%05d] %s %s could not found a suitable resolver", m.Id, q.Name, dns.Type(q.Qtype).String())
-		r := m.Copy()
-		r.MsgHdr.Rcode = dns.RcodeServerFailure
-		w.WriteMsg(r)
-		return
+		err := fmt.Errorf("could not found a sutable resolver for this query")
+		return nil, err
 	}
-	type Result struct {
-		resolver *Resolver
-		msg      *dns.Msg
-		rtt      time.Duration
-		err      error
-	}
-	results := make(chan *Result, len(resolvers))
+	m := &dns.Msg{}
+	m.Id = dns.Id()
+	m.Question = []dns.Question{q}
+	m.RecursionDesired = true
+
+	results := make(chan *queryResult, len(resolvers))
 	defer close(results)
 	wg := sync.WaitGroup{}
 	wg.Add(len(resolvers))
@@ -166,41 +234,24 @@ func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 				return
 			}
 			r.Id = m.Id
-			results <- &Result{resolver, r, rtt, err}
+			results <- &queryResult{resolver, r, rtt, err, time.Now()}
 		}(resolver)
 	}
-	var result *Result
+	var result *queryResult
 	for i := len(resolvers); i != 0; i-- {
 		result = <-results
 		if result.err == nil {
 			break
 		}
 	}
-	question := m.Question[0]
-	resolver := result.resolver
-	log.Printf(
-		"[%05d] %s %s %s -> %s %s %s\n",
-		m.Id,
-		question.Name,
-		dns.Type(question.Qtype).String(),
-		w.RemoteAddr(),
-		resolver.address,
-		resolver.client.Net,
-		result.rtt.Round(time.Millisecond),
-	)
 
-	for _, action := range postActions {
-		action.Do(result.msg)
+	if result.err == nil {
+		for _, a := range postActions {
+			a.Do(result.msg)
+		}
 	}
 
-	err := w.WriteMsg(result.msg)
-	if err != nil {
-		log.Printf(
-			"[%05d] cannot send answer to client %s\n",
-			m.Id,
-			err,
-		)
-	}
+	return result, nil
 }
 
 func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[string][]*Resolver, err error) {
@@ -512,4 +563,16 @@ func withDefaultPort(address, defaultPort string) string {
 		host, port = address, defaultPort
 	}
 	return net.JoinHostPort(host, port)
+}
+
+type queryResult struct {
+	resolver   *Resolver
+	msg        *dns.Msg
+	rtt        time.Duration
+	err        error
+	resolvedAt time.Time
+}
+
+type questCacheKey struct {
+	domain string
 }
