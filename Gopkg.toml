@@ -26,8 +26,12 @@
 
 
 [[constraint]]
+  branch = "master"
+  name = "github.com/bluele/gcache"
+
+[[constraint]]
   name = "github.com/miekg/dns"
-  version = "1.0.5"
+  version = "1.0.7"
 
 [[constraint]]
   branch = "v2"

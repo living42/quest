@@ -2,10 +2,16 @@
 
 
 [[projects]]
+  branch = "master"
+  name = "github.com/bluele/gcache"
+  packages = ["."]
+  revision = "472614239ac7e5bc6461e237c798a6ebd5aff8c1"
+
+[[projects]]
   name = "github.com/miekg/dns"
   packages = ["."]
-  revision = "83c435cc65d2862736428b9b4d07d0ab10ad3e4d"
-  version = "v1.0.5"
+  revision = "e57bf427e68187a27e22adceac868350d7a7079b"
+  version = "v1.0.7"
 
 [[projects]]
   branch = "master"
@@ -14,7 +20,7 @@
     "ed25519",
     "ed25519/internal/edwards25519"
   ]
-  revision = "b49d69b5da943f7ef3c9cf91c8777c1f78a0cc3c"
+  revision = "a3beeb748656e13e54256fd2cde19e058f41f60f"
 
 [[projects]]
   branch = "master"
@@ -27,7 +33,7 @@
     "ipv4",
     "ipv6"
   ]
-  revision = "5f9ae10d9af5b1c89ae6904293b14b064d4ada23"
+  revision = "dfa909b99c79129e1100513e5cd36307665e5723"
 
 [[projects]]
   branch = "v2"
@@ -44,6 +50,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "5db26c311da50e39005f7acf7e3c807de70ae83932873cfc6820be6b6b1e90cf"
+  inputs-digest = "6575e5c1cc17c0147bf44df323ae6fd43b4a5ee72a8b9ea7dc3418c8a1eccea7"
   solver-name = "gps-cdcl"
   solver-version = 1
