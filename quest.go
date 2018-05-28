@@ -211,10 +211,14 @@ func (s *questServer) query(q dns.Question) (*queryResult, error) {
 	m.RecursionDesired = true
 
 	results := make(chan *queryResult, len(resolvers))
-	defer close(results)
 	wg := sync.WaitGroup{}
 	wg.Add(len(resolvers))
-	defer wg.Wait()
+	defer func() {
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
+	}()
 
 	for _, resolver := range resolvers {
 		go func(resolver *Resolver) {
@@ -233,6 +237,7 @@ func (s *questServer) query(q dns.Question) (*queryResult, error) {
 				log.Printf("%s canceled\n", resolver.address)
 				return
 			}
+			log.Printf("got answer from %s\n", resolver.address)
 			r.Id = m.Id
 			results <- &queryResult{resolver, r, rtt, err, time.Now()}
 		}(resolver)
