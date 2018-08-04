@@ -196,7 +196,7 @@ func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 }
 
 func (s *questServer) query(q dns.Question) (*queryResult, error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(30*time.Second))
 	defer cancel()
 
 	var resolvers []*Resolver
