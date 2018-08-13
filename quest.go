@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/bluele/gcache"
@@ -196,7 +195,7 @@ func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 }
 
 func (s *questServer) query(q dns.Question) (*queryResult, error) {
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(30*time.Second))
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
 	defer cancel()
 
 	var resolvers []*Resolver
@@ -211,32 +210,25 @@ func (s *questServer) query(q dns.Question) (*queryResult, error) {
 	m.RecursionDesired = true
 
 	results := make(chan *queryResult, len(resolvers))
-	wg := sync.WaitGroup{}
-	wg.Add(len(resolvers))
-	defer func() {
-		go func() {
-			wg.Wait()
-			close(results)
-		}()
-	}()
 
 	for _, resolver := range resolvers {
 		go func(resolver *Resolver) {
-			defer wg.Done()
 			msgCopy := m.Copy()
 			msgCopy.Id = dns.Id()
 			log.Printf("send query to %s\n", resolver.address)
 			r, rtt, err := resolver.Resolve(ctx, msgCopy)
+			if ctx.Err() == context.Canceled {
+				// canceled
+				log.Printf("%s canceled\n", resolver.address)
+				return
+			}
+
 			if err != nil {
 				log.Printf("[%05d] failed to send message to %s: %s\n", m.Id, resolver.address, err)
 				r = msgCopy
 				r.MsgHdr.Rcode = dns.RcodeServerFailure
 			}
-			if r == nil {
-				// canceled
-				log.Printf("%s canceled\n", resolver.address)
-				return
-			}
+
 			log.Printf("got answer from %s\n", resolver.address)
 			r.Id = m.Id
 			results <- &queryResult{resolver, r, rtt, err, time.Now()}
@@ -256,7 +248,7 @@ func (s *questServer) query(q dns.Question) (*queryResult, error) {
 		}
 	}
 
-	return result, nil
+	return result, result.err
 }
 
 func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[string][]*Resolver, err error) {
