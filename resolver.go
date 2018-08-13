@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net"
 	"sync"
@@ -54,40 +53,26 @@ func (c *Resolver) Resolve(ctx context.Context, m *dns.Msg) (r *dns.Msg, rtt tim
 	start := time.Now()
 	defer func() { rtt = time.Now().Sub(start) }()
 
-	retryCount := 0
-	var co *conn
-	for ; retryCount < c.config.maxRetryCount; retryCount++ {
-		co, err = c.getConn()
-		if err != nil {
-			continue
-		}
-		log.Printf("open %s - %s\n", co.LocalAddr(), co.RemoteAddr())
-		err = co.writeReq(m)
-		if err != nil {
-			continue
-		}
+	co, err := c.getConn()
+	if err != nil {
+		return
+	}
+	log.Printf("open %s - %s\n", co.LocalAddr(), co.RemoteAddr())
+	err = co.writeReq(m)
+	if err != nil {
+		return
+	}
 
-		select {
-		case <-ctx.Done():
-			r = nil
-			err = nil
-			return
-		case res := <-co.resCh:
-			if res == nil {
-				continue
-			}
-			r = res.r
-			err = res.err
-			if err != nil {
-				continue
-			}
-			return
-		}
+	select {
+	case <-ctx.Done():
+		r = nil
+		err = ctx.Err()
+		return
+	case res := <-co.resCh:
+		r = res.r
+		err = res.err
+		return
 	}
-	if retryCount > c.config.maxRetryCount {
-		err = fmt.Errorf("max retry exceeded: %s", err)
-	}
-	return
 }
 
 func (c *Resolver) getConn() (*conn, error) {
