@@ -19,10 +19,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bluele/gcache"
+	tomb "gopkg.in/tomb.v2"
+
+	"github.com/go-yaml/yaml"
 	"github.com/miekg/dns"
-	"gopkg.in/tomb.v2"
-	"gopkg.in/yaml.v2"
 )
 
 func main() {
@@ -48,7 +48,6 @@ type questServer struct {
 		addr string
 		net  string
 	}
-	cache          gcache.Cache
 	namedResolvers map[string][]*Resolver
 	routes         map[string]*questRouteTable
 
@@ -82,13 +81,8 @@ func newServer(configPath string) (server *questServer, err error) {
 		namedResolvers: namedResolvers,
 		routes:         routes,
 	}
-	server.cache = server.newCache(config.Server.CacheSize)
 
 	return
-}
-
-func (s *questServer) newCache(cacheSize int) gcache.Cache {
-	return gcache.New(cacheSize).ARC().LoaderExpireFunc(s.loaderExpireFunc).Build()
 }
 
 func (s *questServer) loaderExpireFunc(key interface{}) (interface{}, *time.Duration, error) {
@@ -151,7 +145,7 @@ func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 
 	start := time.Now()
 	q := m.Question[0]
-	v, err := s.cache.Get(q)
+	result, err := s.query(q)
 
 	var r *dns.Msg
 	if err != nil {
@@ -159,7 +153,6 @@ func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 		r = m.Copy()
 		r.MsgHdr.Rcode = dns.RcodeServerFailure
 	} else {
-		result := v.(*queryResult)
 		r = result.msg.Copy()
 		r.Id = m.Id
 		now := time.Now()
@@ -495,8 +488,7 @@ type ConfigRoute map[string]string
 
 // ConfigServer config struct
 type ConfigServer struct {
-	Listens   []map[string]string `yaml:"listens"`
-	CacheSize int                 `yaml:"cache_size"`
+	Listens []map[string]string `yaml:"listens"`
 }
 
 // ConfigResolver config struct
@@ -507,8 +499,7 @@ type ConfigResolver struct {
 func readConfig(configPath string) (config *Config, err error) {
 	config = &Config{
 		Server: ConfigServer{
-			Listens:   make([]map[string]string, 0),
-			CacheSize: 1000,
+			Listens: make([]map[string]string, 0),
 		},
 		Resolvers: make(map[string]ConfigResolver),
 		Routes:    make(map[string][]ConfigRoute),
@@ -568,8 +559,4 @@ type queryResult struct {
 	rtt        time.Duration
 	err        error
 	resolvedAt time.Time
-}
-
-type questCacheKey struct {
-	domain string
 }

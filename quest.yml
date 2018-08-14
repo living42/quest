@@ -2,7 +2,6 @@ server:
   listens:
     - TCP: :7053
     - UDP: :7053
-  cache_size: 1000
 
 resolvers:
   china:
