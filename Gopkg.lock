@@ -2,28 +2,35 @@
 
 
 [[projects]]
-  branch = "master"
-  name = "github.com/bluele/gcache"
+  digest = "1:342378ac4dcb378a5448dd723f0784ae519383532f5e70ade24132c4c8693202"
+  name = "github.com/go-yaml/yaml"
   packages = ["."]
-  revision = "472614239ac7e5bc6461e237c798a6ebd5aff8c1"
+  pruneopts = "UT"
+  revision = "5420a8b6744d3b0345ab293f6fcba19c978f1183"
+  version = "v2.2.1"
 
 [[projects]]
+  digest = "1:c6fe3b8ac122ea07b32d37990ed35fb4838761bbb151d93c1b22d2d4eec798bb"
   name = "github.com/miekg/dns"
   packages = ["."]
+  pruneopts = "UT"
   revision = "e57bf427e68187a27e22adceac868350d7a7079b"
   version = "v1.0.7"
 
 [[projects]]
   branch = "master"
+  digest = "1:6d3fd61842d17fc8731b167771cfb564d06cb71c75fcb7efbe9b368a6081c1f3"
   name = "golang.org/x/crypto"
   packages = [
     "ed25519",
-    "ed25519/internal/edwards25519"
+    "ed25519/internal/edwards25519",
   ]
+  pruneopts = "UT"
   revision = "a3beeb748656e13e54256fd2cde19e058f41f60f"
 
 [[projects]]
   branch = "master"
+  digest = "1:0dcbaf802d84a78010a55836deb9b5c328e5c4c9ee6baa31cf37d0e22d8c8831"
   name = "golang.org/x/net"
   packages = [
     "bpf",
@@ -31,25 +38,26 @@
     "internal/iana",
     "internal/socket",
     "ipv4",
-    "ipv6"
+    "ipv6",
   ]
+  pruneopts = "UT"
   revision = "dfa909b99c79129e1100513e5cd36307665e5723"
 
 [[projects]]
   branch = "v2"
+  digest = "1:5bb148b78468350091db2ffbb2370f35cc6dcd74d9378a31b1c7b86ff7528f08"
   name = "gopkg.in/tomb.v2"
   packages = ["."]
+  pruneopts = "UT"
   revision = "d5d1b5820637886def9eef33e03a27a9f166942c"
-
-[[projects]]
-  name = "gopkg.in/yaml.v2"
-  packages = ["."]
-  revision = "5420a8b6744d3b0345ab293f6fcba19c978f1183"
-  version = "v2.2.1"
 
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "6575e5c1cc17c0147bf44df323ae6fd43b4a5ee72a8b9ea7dc3418c8a1eccea7"
+  input-imports = [
+    "github.com/go-yaml/yaml",
+    "github.com/miekg/dns",
+    "gopkg.in/tomb.v2",
+  ]
   solver-name = "gps-cdcl"
   solver-version = 1
