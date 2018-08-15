@@ -125,7 +125,6 @@ func (c *conn) writeReq(m *dns.Msg) error {
 func (c *conn) readloop() {
 	defer func() {
 		c.Close()
-		close(c.resCh)
 		c.r.removeIdle(c)
 		log.Printf("close %s - %s\n", c.LocalAddr(), c.RemoteAddr())
 	}()
