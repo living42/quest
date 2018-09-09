@@ -4,11 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
-	"sync"
 	"time"
 
 	"github.com/miekg/dns"
+	"gopkg.in/tomb.v2"
 )
 
 // Resolver resolver interface
@@ -17,14 +16,159 @@ type Resolver interface {
 	Server() string
 }
 
-// Resolver resolver
-type someResolver struct {
-	address string
+type resolver2Msg struct {
+	m    *dns.Msg
+	rmsg *dns.Msg
+	err  error
+	done chan struct{}
+}
+
+func (r *resolver2Msg) markAsDone() {
+	select {
+	case <-r.done:
+	default:
+		close(r.done)
+	}
+}
+
+type resolver2Conn struct {
+	tomb       tomb.Tomb
+	conn       *dns.Conn
+	flyingMsgs map[uint16]*resolver2Msg
+}
+
+func newResolver2Conn(client *dns.Client, address string) (*resolver2Conn, error) {
+	r := resolver2Conn{
+		flyingMsgs: make(map[uint16]*resolver2Msg),
+	}
+
+	log.Printf("dial to %s://%s\n", client.Net, address)
+	conn, err := client.Dial(address)
+	if err != nil {
+		return nil, err
+	}
+
+	r.conn = conn
+
+	r.tomb.Go(r.readLoop)
+
+	r.tomb.Go(func() error {
+		<-r.tomb.Dying()
+		log.Printf("diying %s://%s", client.Net, address)
+		return nil
+	})
+
+	return &r, nil
+}
+
+func (r *resolver2Conn) writeMsg(msg *resolver2Msg) error {
+	err := r.conn.WriteMsg(msg.m)
+	if err != nil {
+		return err
+	}
+	r.flyingMsgs[msg.m.Id] = msg
+	return nil
+}
+
+func (r *resolver2Conn) readLoop() error {
+	defer r.conn.Close()
+
+	conn := r.conn
+
+	for {
+		rmsg, err := conn.ReadMsg()
+
+		if err != nil {
+			for _, msg := range r.flyingMsgs {
+				msg.err = err
+				msg.markAsDone()
+			}
+			return err
+		}
+
+		if msg, ok := r.flyingMsgs[rmsg.Id]; ok {
+			msg.rmsg = rmsg
+			msg.err = err
+			msg.markAsDone()
+			delete(r.flyingMsgs, rmsg.Id)
+		}
+
+	}
+}
+
+func (r *resolver2Conn) Dying() <-chan struct{} {
+	return r.tomb.Dying()
+}
+
+type resolver2 struct {
 	client  *dns.Client
-	connsMu sync.Mutex
-	config  ResolverConfig
-	idles   []*conn
-	idleMu  sync.Mutex
+	address string
+	msgCh   chan *resolver2Msg
+}
+
+func newResolver2(address string, c *dns.Client, config *ResolverConfig) *resolver2 {
+	r := resolver2{
+		client:  c,
+		address: address,
+		msgCh:   make(chan *resolver2Msg),
+	}
+
+	go r.scheduler()
+
+	return &r
+}
+
+func (r *resolver2) scheduler() {
+	msgChIn := r.msgCh
+
+	var conn *resolver2Conn
+	var err error
+
+	for msg := range msgChIn {
+		err = nil
+
+		if conn == nil {
+			conn, err = newResolver2Conn(r.client, r.address)
+		} else {
+			select {
+			case <-conn.Dying():
+				conn, err = newResolver2Conn(r.client, r.address)
+			default:
+			}
+		}
+
+		if err != nil {
+			msg.err = err
+			msg.markAsDone()
+		} else {
+			err = conn.writeMsg(msg)
+			if err != nil {
+				msg.err = err
+				msg.markAsDone()
+			}
+		}
+	}
+}
+
+func (r *resolver2) Server() string {
+	return fmt.Sprintf("%s://%s", r.client.Net, r.address)
+}
+
+func (r *resolver2) Resolve(ctx context.Context, m *dns.Msg) (rmsg *dns.Msg, rtt time.Duration, err error) {
+	msg := resolver2Msg{
+		m:    m,
+		done: make(chan struct{}),
+	}
+	r.msgCh <- &msg
+	select {
+	case <-msg.done:
+		rmsg = msg.rmsg
+		err = msg.err
+		return
+	case <-ctx.Done():
+		err = ctx.Err()
+		return
+	}
 }
 
 // ResolverConfig config
@@ -41,159 +185,4 @@ func DefaultResolverConfig() *ResolverConfig {
 		maxRetryCount: 5,
 		maxIdleTime:   30 * time.Second,
 	}
-}
-
-func newResolver(address string, c *dns.Client, config *ResolverConfig) *someResolver {
-	if config == nil {
-		config = DefaultResolverConfig()
-	}
-	return &someResolver{
-		address: address,
-		client:  c,
-		config:  *config,
-		idles:   make([]*conn, 0),
-	}
-}
-
-func (c *someResolver) Server() string {
-	return fmt.Sprintf("%s://%s", c.client.Net, c.address)
-}
-
-// Resolve resolver
-func (c *someResolver) Resolve(ctx context.Context, m *dns.Msg) (r *dns.Msg, rtt time.Duration, err error) {
-	start := time.Now()
-	defer func() { rtt = time.Now().Sub(start) }()
-
-	co, err := c.getConn()
-	if err != nil {
-		return
-	}
-	log.Printf("open %s - %s\n", co.LocalAddr(), co.RemoteAddr())
-	err = co.writeReq(m)
-	if err != nil {
-		return
-	}
-
-	select {
-	case <-ctx.Done():
-		r = nil
-		err = ctx.Err()
-		return
-	case res := <-co.resCh:
-		r = res.r
-		err = res.err
-		return
-	}
-}
-
-func (c *someResolver) getConn() (*conn, error) {
-	co := c.getIdleConn()
-	if co != nil {
-		log.Printf("use idle conn %s - %s\n", co.LocalAddr(), co.RemoteAddr())
-		return co, nil
-	}
-
-	dc, err := c.client.Dial(c.address)
-	if err != nil {
-		return nil, err
-	}
-	co = &conn{Conn: dc, resCh: make(chan *result), r: c}
-	go co.readloop()
-	return co, nil
-}
-
-func (c *someResolver) getIdleConn() *conn {
-	c.idleMu.Lock()
-	defer c.idleMu.Unlock()
-	if len(c.idles) > 0 {
-		co := c.idles[0]
-		c.idles = c.idles[1:]
-		return co
-	}
-	return nil
-}
-
-type conn struct {
-	*dns.Conn
-	resCh chan *result
-	r     *someResolver
-}
-
-type result struct {
-	r   *dns.Msg
-	err error
-}
-
-func (c *conn) writeReq(m *dns.Msg) error {
-	err := c.WriteMsg(m)
-	if err != nil {
-		return err
-	}
-	c.SetReadDeadline(time.Now().Add(15 * time.Second))
-	return nil
-}
-
-func (c *conn) readloop() {
-	defer func() {
-		c.Close()
-		c.r.removeIdle(c)
-		log.Printf("close %s - %s\n", c.LocalAddr(), c.RemoteAddr())
-	}()
-
-	start := time.Now()
-
-	for {
-		c.SetReadDeadline(time.Now().Add(15 * time.Second))
-		r, err := c.ReadMsg()
-		c.SetReadDeadline(time.Time{})
-		select {
-		case c.resCh <- &result{r: r, err: err}:
-		default:
-		}
-		if err != nil {
-			if netErr, ok := err.(*net.OpError); !ok || netErr.Timeout() {
-				return
-			}
-		}
-		if time.Now().Sub(start) > c.r.config.maxIdleTime {
-			return
-		}
-		if !c.r.putIdle(c) {
-			return
-		}
-		log.Printf("put idle conn %s - %s\n", c.LocalAddr(), c.RemoteAddr())
-	}
-}
-
-func (c *someResolver) putIdle(co *conn) bool {
-	c.idleMu.Lock()
-	defer c.idleMu.Unlock()
-	if len(c.idles) >= c.config.maxIdleConn {
-		return false
-	}
-	c.idles = append(c.idles, co)
-	return true
-}
-
-func (c *someResolver) removeIdle(co *conn) bool {
-	c.idleMu.Lock()
-	defer c.idleMu.Unlock()
-	switch len(c.idles) {
-	case 0:
-		return false
-	case 1:
-		if c.idles[0] == co {
-			c.idles = c.idles[1:]
-			return true
-		}
-	default:
-		for i, v := range c.idles {
-			if v != co {
-				continue
-			}
-			c.idles = append(c.idles[:i], c.idles[i+1:]...)
-			return true
-		}
-	}
-	return false
 }

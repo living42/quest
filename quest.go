@@ -211,17 +211,17 @@ func (s *questServer) query(q dns.Question) (*queryResult, error) {
 			r, rtt, err := resolver.Resolve(ctx, msgCopy)
 			if ctx.Err() == context.Canceled {
 				// canceled
-				// log.Printf("%s canceled\n", resolver.address)
+				log.Printf("%s canceled\n", resolver.Server())
 				return
 			}
 
 			if err != nil {
-				// log.Printf("[%05d] failed to send message to %s: %s\n", m.Id, resolver.address, err)
+				log.Printf("[%05d] failed to send message to %s: %s\n", m.Id, resolver.Server(), err)
 				r = msgCopy
 				r.MsgHdr.Rcode = dns.RcodeServerFailure
 			}
 
-			// log.Printf("got answer from %s\n", resolver.address)
+			log.Printf("got answer from %s\n", resolver.Server())
 			r.Id = m.Id
 			results <- &queryResult{resolver, r, rtt, err, time.Now()}
 		}(resolver)
@@ -283,7 +283,7 @@ func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[strin
 					return
 				}
 				c := &dns.Client{Net: "tcp"}
-				r = newResolver(address, c, nil)
+				r = newResolver2(address, c, nil)
 			case "udp":
 				address = withDefaultPort(address, "53")
 				_, err = net.ResolveUDPAddr("udp", address)
@@ -291,7 +291,7 @@ func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[strin
 					return
 				}
 				c := &dns.Client{Net: "udp"}
-				r = newResolver(address, c, nil)
+				r = newResolver2(address, c, nil)
 			case "dns-over-tls":
 				address = withDefaultPort(address, "853")
 				var hostname string
@@ -307,7 +307,7 @@ func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[strin
 					return
 				}
 				c := &dns.Client{Net: "tcp-tls", TLSConfig: &tls.Config{ServerName: hostname}}
-				r = newResolver(address, c, nil)
+				r = newResolver2(address, c, nil)
 			default:
 				err = fmt.Errorf("Invalid config: invalid mode at resolver '%s'", name)
 				return
