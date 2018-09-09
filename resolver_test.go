@@ -8,7 +8,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-func testResolve(resolver *Resolver, t *testing.T) {
+func testResolve(resolver Resolver, t *testing.T) {
 	for i := 0; i < 10; i++ {
 
 		for j := 0; j < 3; j++ {

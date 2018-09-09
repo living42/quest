@@ -48,7 +48,7 @@ type questServer struct {
 		addr string
 		net  string
 	}
-	namedResolvers map[string][]*Resolver
+	namedResolvers map[string][]Resolver
 	routes         map[string]*questRouteTable
 
 	t       tomb.Tomb
@@ -170,13 +170,12 @@ func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 		resolver := result.resolver
 		rtt := time.Now().Sub(start)
 		log.Printf(
-			"[%05d] %s %s %s -> %s %s %s\n",
+			"[%05d] %s %s %s -> %s %s\n",
 			m.Id,
 			question.Name,
 			dns.Type(question.Qtype).String(),
 			w.RemoteAddr(),
-			resolver.address,
-			resolver.client.Net,
+			resolver.Server(),
 			rtt.Round(time.Millisecond),
 		)
 	}
@@ -191,7 +190,7 @@ func (s *questServer) query(q dns.Question) (*queryResult, error) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
 	defer cancel()
 
-	var resolvers []*Resolver
+	var resolvers []Resolver
 	resolvers, postActions := s.routes["main"].Route(q.Name)
 	if resolvers == nil {
 		err := fmt.Errorf("could not found a sutable resolver for this query")
@@ -205,24 +204,24 @@ func (s *questServer) query(q dns.Question) (*queryResult, error) {
 	results := make(chan *queryResult, len(resolvers))
 
 	for _, resolver := range resolvers {
-		go func(resolver *Resolver) {
+		go func(resolver Resolver) {
 			msgCopy := m.Copy()
 			msgCopy.Id = dns.Id()
-			log.Printf("send query to %s\n", resolver.address)
+			// log.Printf("send query to %s\n", resolver.address)
 			r, rtt, err := resolver.Resolve(ctx, msgCopy)
 			if ctx.Err() == context.Canceled {
 				// canceled
-				log.Printf("%s canceled\n", resolver.address)
+				// log.Printf("%s canceled\n", resolver.address)
 				return
 			}
 
 			if err != nil {
-				log.Printf("[%05d] failed to send message to %s: %s\n", m.Id, resolver.address, err)
+				// log.Printf("[%05d] failed to send message to %s: %s\n", m.Id, resolver.address, err)
 				r = msgCopy
 				r.MsgHdr.Rcode = dns.RcodeServerFailure
 			}
 
-			log.Printf("got answer from %s\n", resolver.address)
+			// log.Printf("got answer from %s\n", resolver.address)
 			r.Id = m.Id
 			results <- &queryResult{resolver, r, rtt, err, time.Now()}
 		}(resolver)
@@ -244,11 +243,11 @@ func (s *questServer) query(q dns.Question) (*queryResult, error) {
 	return result, result.err
 }
 
-func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[string][]*Resolver, err error) {
-	namedResolvers = make(map[string][]*Resolver)
+func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[string][]Resolver, err error) {
+	namedResolvers = make(map[string][]Resolver)
 
 	for name, config := range configs {
-		resolvers := make([]*Resolver, 0)
+		resolvers := make([]Resolver, 0)
 		for _, rawServerConfig := range config.Server {
 			serverConfig, ok := rawServerConfig.(map[interface{}]interface{})
 			if !ok {
@@ -262,7 +261,7 @@ func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[strin
 				}
 			}
 
-			var r *Resolver
+			var r Resolver
 			var address string
 			if i, ok := serverConfig["address"]; !ok {
 				err = fmt.Errorf("Invalid config: address are required at resolver '%s'", name)
@@ -320,7 +319,7 @@ func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[strin
 	return
 }
 
-func buildRoutes(routesConfig map[string][]ConfigRoute, namedResolvers map[string][]*Resolver) (routes map[string]*questRouteTable, err error) {
+func buildRoutes(routesConfig map[string][]ConfigRoute, namedResolvers map[string][]Resolver) (routes map[string]*questRouteTable, err error) {
 	routes = make(map[string]*questRouteTable)
 	for name := range routesConfig {
 		routes[name] = &questRouteTable{routes: make([]*questRoute, 0), name: name}
@@ -419,7 +418,7 @@ type questRouteTable struct {
 	routes []*questRoute
 }
 
-func (r *questRouteTable) Route(domain string) (resolvers []*Resolver, cumulatedPostActions []questPostAction) {
+func (r *questRouteTable) Route(domain string) (resolvers []Resolver, cumulatedPostActions []questPostAction) {
 	cumulatedPostActions = make([]questPostAction, 0)
 	for _, route := range r.routes {
 		var postActions []questPostAction
@@ -436,10 +435,10 @@ type questRoute struct {
 	rule       questRule
 	table      *questRouteTable
 	postAction questPostAction
-	resolvers  []*Resolver
+	resolvers  []Resolver
 }
 
-func (r *questRoute) Route(domain string) (resolvers []*Resolver, cumulatedPostActions []questPostAction) {
+func (r *questRoute) Route(domain string) (resolvers []Resolver, cumulatedPostActions []questPostAction) {
 	cumulatedPostActions = make([]questPostAction, 0)
 	if r.rule.Match(domain) {
 		if r.postAction != nil {
@@ -554,7 +553,7 @@ func withDefaultPort(address, defaultPort string) string {
 }
 
 type queryResult struct {
-	resolver   *Resolver
+	resolver   Resolver
 	msg        *dns.Msg
 	rtt        time.Duration
 	err        error

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"sync"
@@ -10,8 +11,14 @@ import (
 	"github.com/miekg/dns"
 )
 
+// Resolver resolver interface
+type Resolver interface {
+	Resolve(ctx context.Context, m *dns.Msg) (r *dns.Msg, rtt time.Duration, err error)
+	Server() string
+}
+
 // Resolver resolver
-type Resolver struct {
+type someResolver struct {
 	address string
 	client  *dns.Client
 	connsMu sync.Mutex
@@ -36,11 +43,11 @@ func DefaultResolverConfig() *ResolverConfig {
 	}
 }
 
-func newResolver(address string, c *dns.Client, config *ResolverConfig) *Resolver {
+func newResolver(address string, c *dns.Client, config *ResolverConfig) *someResolver {
 	if config == nil {
 		config = DefaultResolverConfig()
 	}
-	return &Resolver{
+	return &someResolver{
 		address: address,
 		client:  c,
 		config:  *config,
@@ -48,8 +55,12 @@ func newResolver(address string, c *dns.Client, config *ResolverConfig) *Resolve
 	}
 }
 
+func (c *someResolver) Server() string {
+	return fmt.Sprintf("%s://%s", c.client.Net, c.address)
+}
+
 // Resolve resolver
-func (c *Resolver) Resolve(ctx context.Context, m *dns.Msg) (r *dns.Msg, rtt time.Duration, err error) {
+func (c *someResolver) Resolve(ctx context.Context, m *dns.Msg) (r *dns.Msg, rtt time.Duration, err error) {
 	start := time.Now()
 	defer func() { rtt = time.Now().Sub(start) }()
 
@@ -75,7 +86,7 @@ func (c *Resolver) Resolve(ctx context.Context, m *dns.Msg) (r *dns.Msg, rtt tim
 	}
 }
 
-func (c *Resolver) getConn() (*conn, error) {
+func (c *someResolver) getConn() (*conn, error) {
 	co := c.getIdleConn()
 	if co != nil {
 		log.Printf("use idle conn %s - %s\n", co.LocalAddr(), co.RemoteAddr())
@@ -91,7 +102,7 @@ func (c *Resolver) getConn() (*conn, error) {
 	return co, nil
 }
 
-func (c *Resolver) getIdleConn() *conn {
+func (c *someResolver) getIdleConn() *conn {
 	c.idleMu.Lock()
 	defer c.idleMu.Unlock()
 	if len(c.idles) > 0 {
@@ -105,7 +116,7 @@ func (c *Resolver) getIdleConn() *conn {
 type conn struct {
 	*dns.Conn
 	resCh chan *result
-	r     *Resolver
+	r     *someResolver
 }
 
 type result struct {
@@ -154,7 +165,7 @@ func (c *conn) readloop() {
 	}
 }
 
-func (c *Resolver) putIdle(co *conn) bool {
+func (c *someResolver) putIdle(co *conn) bool {
 	c.idleMu.Lock()
 	defer c.idleMu.Unlock()
 	if len(c.idles) >= c.config.maxIdleConn {
@@ -164,7 +175,7 @@ func (c *Resolver) putIdle(co *conn) bool {
 	return true
 }
 
-func (c *Resolver) removeIdle(co *conn) bool {
+func (c *someResolver) removeIdle(co *conn) bool {
 	c.idleMu.Lock()
 	defer c.idleMu.Unlock()
 	switch len(c.idles) {
