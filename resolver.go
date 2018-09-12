@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -34,13 +35,11 @@ func (r *resolver2Msg) markAsDone() {
 type resolver2Conn struct {
 	tomb       tomb.Tomb
 	conn       *dns.Conn
-	flyingMsgs map[uint16]*resolver2Msg
+	flyingMsgs sync.Map
 }
 
 func newResolver2Conn(client *dns.Client, address string) (*resolver2Conn, error) {
-	r := resolver2Conn{
-		flyingMsgs: make(map[uint16]*resolver2Msg),
-	}
+	r := resolver2Conn{}
 
 	log.Printf("dial to %s://%s\n", client.Net, address)
 	conn, err := client.Dial(address)
@@ -66,7 +65,18 @@ func (r *resolver2Conn) writeMsg(msg *resolver2Msg) error {
 	if err != nil {
 		return err
 	}
-	r.flyingMsgs[msg.m.Id] = msg
+	r.flyingMsgs.Store(msg.m.Id, msg)
+	go func() {
+		select {
+		case <-msg.done:
+		case <-time.After(30 * time.Second):
+		case <-r.Dying():
+		}
+		if v, ok := r.flyingMsgs.Load(msg.m.Id); ok {
+			v.(*resolver2Msg).markAsDone()
+		}
+		r.flyingMsgs.Delete(msg.m.Id)
+	}()
 	return nil
 }
 
@@ -79,18 +89,20 @@ func (r *resolver2Conn) readLoop() error {
 		rmsg, err := conn.ReadMsg()
 
 		if err != nil {
-			for _, msg := range r.flyingMsgs {
+			r.flyingMsgs.Range(func(_, v interface{}) bool {
+				msg := v.(*resolver2Msg)
 				msg.err = err
 				msg.markAsDone()
-			}
+				return true
+			})
 			return err
 		}
 
-		if msg, ok := r.flyingMsgs[rmsg.Id]; ok {
+		if v, ok := r.flyingMsgs.Load(rmsg.Id); ok {
+			msg := v.(*resolver2Msg)
 			msg.rmsg = rmsg
 			msg.err = err
 			msg.markAsDone()
-			delete(r.flyingMsgs, rmsg.Id)
 		}
 
 	}
