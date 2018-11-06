@@ -30,18 +30,18 @@ func testResolve(resolver Resolver, t *testing.T) {
 
 func TestResolveViaTLS(t *testing.T) {
 	c := &dns.Client{Net: "tcp-tls"}
-	resolver := newResolver("1.1.1.1:853", c, nil)
+	resolver := newResolver2("1.1.1.1:853", c, nil)
 	testResolve(resolver, t)
 }
 
 func TestResolveViaUDP(t *testing.T) {
 	c := &dns.Client{Net: "udp"}
-	resolver := newResolver("1.1.1.1:53", c, nil)
+	resolver := newResolver2("1.1.1.1:53", c, nil)
 	testResolve(resolver, t)
 }
 
 func TestResolveViaTCP(t *testing.T) {
 	c := &dns.Client{Net: "tcp"}
-	resolver := newResolver("1.1.1.1:53", c, nil)
+	resolver := newResolver2("1.1.1.1:53", c, nil)
 	testResolve(resolver, t)
 }
