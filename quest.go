@@ -282,7 +282,12 @@ func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[strin
 				if err != nil {
 					return
 				}
-				c := &dns.Client{Net: "tcp"}
+				var timeout time.Duration
+				timeout, err = parseTimeout(serverConfig, name)
+				if err != nil {
+					return
+				}
+				c := &dns.Client{Net: "tcp", Timeout: timeout}
 				r = newResolver2(address, c, nil)
 			case "udp":
 				address = withDefaultPort(address, "53")
@@ -290,7 +295,12 @@ func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[strin
 				if err != nil {
 					return
 				}
-				c := &dns.Client{Net: "udp"}
+				var timeout time.Duration
+				timeout, err = parseTimeout(serverConfig, name)
+				if err != nil {
+					return
+				}
+				c := &dns.Client{Net: "udp", Timeout: timeout}
 				r = newResolver2(address, c, nil)
 			case "dns-over-tls":
 				address = withDefaultPort(address, "853")
@@ -306,7 +316,12 @@ func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[strin
 				if err != nil {
 					return
 				}
-				c := &dns.Client{Net: "tcp-tls", TLSConfig: &tls.Config{ServerName: hostname}}
+				var timeout time.Duration
+				timeout, err = parseTimeout(serverConfig, name)
+				if err != nil {
+					return
+				}
+				c := &dns.Client{Net: "tcp-tls", TLSConfig: &tls.Config{ServerName: hostname}, Timeout: timeout}
 				r = newResolver2(address, c, nil)
 			default:
 				err = fmt.Errorf("Invalid config: invalid mode at resolver '%s'", name)
@@ -315,6 +330,23 @@ func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[strin
 			resolvers = append(resolvers, r)
 		}
 		namedResolvers[name] = resolvers
+	}
+	return
+}
+
+func parseTimeout(config map[interface{}]interface{}, name string) (dur time.Duration, err error) {
+	dur = 5 * time.Second
+	if i, ok := config["timeout"]; ok {
+		s, ok := i.(string)
+		if !ok {
+			err = fmt.Errorf("Invalid config: timeout must be a string at resolver '%s'", name)
+			return
+		}
+		dur, err = time.ParseDuration(s)
+		if err != nil {
+			err = fmt.Errorf("Invalid config: unknown timeout format (hints: 15s, 1m) at resolver '%s'", name)
+			return
+		}
 	}
 	return
 }
