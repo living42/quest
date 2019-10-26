@@ -8,7 +8,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -21,6 +20,7 @@ import (
 
 	tomb "gopkg.in/tomb.v2"
 
+	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/go-yaml/yaml"
 	"github.com/miekg/dns"
 )
@@ -48,7 +48,7 @@ type questServer struct {
 		addr string
 		net  string
 	}
-	namedResolvers map[string][]Resolver
+	namedUpstreams map[string][]upstream.Upstream
 	routes         map[string]*questRouteTable
 
 	t       tomb.Tomb
@@ -66,19 +66,19 @@ func newServer(configPath string) (server *questServer, err error) {
 		return
 	}
 
-	namedResolvers, err := buildResolvers(config.Resolvers)
+	namedUpstreams, err := buildUpstreams(config.Resolvers)
 	if err != nil {
 		return
 	}
 
-	routes, err := buildRoutes(config.Routes, namedResolvers)
+	routes, err := buildRoutes(config.Routes, namedUpstreams)
 	if err != nil {
 		return
 	}
 
 	server = &questServer{
 		listens:        listens,
-		namedResolvers: namedResolvers,
+		namedUpstreams: namedUpstreams,
 		routes:         routes,
 	}
 
@@ -86,25 +86,26 @@ func newServer(configPath string) (server *questServer, err error) {
 }
 
 func (s *questServer) loaderExpireFunc(key interface{}) (interface{}, *time.Duration, error) {
-	q := key.(dns.Question)
-	result, err := s.query(q)
-	if err != nil {
-		return nil, nil, err
-	}
-	var ttl time.Duration
-	if len(result.msg.Answer) == 0 {
-		ttl = 5 * time.Second
-	} else {
-		a := result.msg.Answer[0]
-		ttl = time.Duration(a.Header().Ttl) * time.Second
-		for _, a = range result.msg.Answer {
-			if a.Header().Rrtype == q.Qtype {
-				ttl = time.Duration(a.Header().Ttl) * time.Second
-				break
-			}
-		}
-	}
-	return result, &ttl, nil
+	// q := key.(dns.Question)
+	// result, err := s.query(q)
+	// if err != nil {
+	// 	return nil, nil, err
+	// }
+	// var ttl time.Duration
+	// if len(result.msg.Answer) == 0 {
+	// 	ttl = 5 * time.Second
+	// } else {
+	// 	a := result.msg.Answer[0]
+	// 	ttl = time.Duration(a.Header().Ttl) * time.Second
+	// 	for _, a = range result.msg.Answer {
+	// 		if a.Header().Rrtype == q.Qtype {
+	// 			ttl = time.Duration(a.Header().Ttl) * time.Second
+	// 			break
+	// 		}
+	// 	}
+	// }
+	// return result, &ttl, nil
+	panic("1")
 }
 
 func (s *questServer) Serve() error {
@@ -153,21 +154,10 @@ func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 		r = m.Copy()
 		r.MsgHdr.Rcode = dns.RcodeServerFailure
 	} else {
-		r = result.msg.Copy()
+		r = result.resp.Copy()
 		r.Id = m.Id
-		now := time.Now()
-		for _, a := range r.Answer {
-			span := now.Sub(result.resolvedAt).Seconds()
-			ttl := a.Header().Ttl
-			if span > float64(ttl) {
-				ttl = 0
-			} else {
-				ttl -= uint32(span)
-			}
-			a.Header().Ttl = ttl
-		}
+
 		question := m.Question[0]
-		resolver := result.resolver
 		rtt := time.Now().Sub(start)
 		log.Printf(
 			"[%05d] %s %s %s -> %s %s\n",
@@ -175,7 +165,7 @@ func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 			question.Name,
 			dns.Type(question.Qtype).String(),
 			w.RemoteAddr(),
-			resolver.Server(),
+			result.u.Address(),
 			rtt.Round(time.Millisecond),
 		)
 	}
@@ -187,12 +177,10 @@ func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
 }
 
 func (s *questServer) query(q dns.Question) (*queryResult, error) {
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
-	defer cancel()
+	ctx := context.Background()
 
-	var resolvers []Resolver
-	resolvers, postActions := s.routes["main"].Route(q.Name)
-	if resolvers == nil {
+	upstreams, postActions := s.routes["main"].Route(q.Name)
+	if upstreams == nil {
 		err := fmt.Errorf("could not found a sutable resolver for this query")
 		return nil, err
 	}
@@ -201,135 +189,61 @@ func (s *questServer) query(q dns.Question) (*queryResult, error) {
 	m.Question = []dns.Question{q}
 	m.RecursionDesired = true
 
-	results := make(chan *queryResult, len(resolvers))
+	rc := make(chan *queryResult, 1)
 
-	for _, resolver := range resolvers {
-		go func(resolver Resolver) {
-			msgCopy := m.Copy()
-			msgCopy.Id = dns.Id()
-			// log.Printf("send query to %s\n", resolver.address)
-			r, rtt, err := resolver.Resolve(ctx, msgCopy)
-			if ctx.Err() == context.Canceled {
-				// canceled
-				log.Printf("%s canceled\n", resolver.Server())
-				return
-			}
+	go func() {
+		msgCopy := m.Copy()
+		msgCopy.Id = dns.Id()
+		start := time.Now()
+		resp, u, err := upstream.ExchangeParallel(upstreams, msgCopy)
+		if ctx.Err() != nil {
+			return
+		}
+		rc <- &queryResult{
+			resp: resp,
+			err:  err,
+			u:    u,
+			rtt:  time.Since(start),
+		}
+	}()
 
-			if err != nil {
-				log.Printf("[%05d] failed to send message to %s: %s\n", m.Id, resolver.Server(), err)
-				r = msgCopy
-				r.MsgHdr.Rcode = dns.RcodeServerFailure
-			}
-
-			log.Printf("got answer from %s\n", resolver.Server())
-			r.Id = m.Id
-			results <- &queryResult{resolver, r, rtt, err, time.Now()}
-		}(resolver)
+	var r *queryResult
+	select {
+	case r = <-rc:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	var result *queryResult
-	for i := len(resolvers); i != 0; i-- {
-		result = <-results
-		if result.err == nil {
-			break
+
+	if r.err != nil {
+		return nil, r.err
+	}
+
+	resp := r.resp.Copy()
+	resp.Id = m.Id
+
+	for _, a := range postActions {
+		err := a.Do(resp)
+		if err != nil {
+			log.Printf("[%05d] failed to do action %T: %s\n", resp.Id, a, err)
 		}
 	}
 
-	if result.err == nil {
-		for _, a := range postActions {
-			a.Do(result.msg)
-		}
-	}
-
-	return result, result.err
+	return r, nil
 }
 
-func buildResolvers(configs map[string]ConfigResolver) (namedResolvers map[string][]Resolver, err error) {
-	namedResolvers = make(map[string][]Resolver)
+func buildUpstreams(configs map[string]ConfigResolver) (namedResolvers map[string][]upstream.Upstream, err error) {
+	namedResolvers = make(map[string][]upstream.Upstream)
 
 	for name, config := range configs {
-		resolvers := make([]Resolver, 0)
-		for _, rawServerConfig := range config.Server {
-			serverConfig, ok := rawServerConfig.(map[interface{}]interface{})
-			if !ok {
-				if address, ok := rawServerConfig.(string); ok {
-					serverConfig = make(map[interface{}]interface{})
-					serverConfig["address"] = address
-					serverConfig["mode"] = "udp"
-				} else {
-					err = fmt.Errorf("Invalid config: invalid resolver config at '%s'", name)
-					return
-				}
+		upstreams := make([]upstream.Upstream, 0)
+		for _, addr := range config.Server {
+			u, err := upstream.AddressToUpstream(addr, upstream.Options{Timeout: 120 * time.Second})
+			if err != nil {
+				panic(err)
 			}
-
-			var r Resolver
-			var address string
-			if i, ok := serverConfig["address"]; !ok {
-				err = fmt.Errorf("Invalid config: address are required at resolver '%s'", name)
-				return
-			} else if address, ok = i.(string); !ok {
-				err = fmt.Errorf("Invalid config: address must be a string at resolver '%s'", name)
-				return
-			}
-			mode := "udp"
-			if i, ok := serverConfig["mode"]; ok {
-				mode, _ = i.(string)
-			}
-
-			switch mode {
-			case "tcp":
-				address = withDefaultPort(address, "53")
-				_, err = net.ResolveTCPAddr("tcp", address)
-				if err != nil {
-					return
-				}
-				var timeout time.Duration
-				timeout, err = parseTimeout(serverConfig, name)
-				if err != nil {
-					return
-				}
-				c := &dns.Client{Net: "tcp", Timeout: timeout}
-				r = newResolver2(address, c, nil)
-			case "udp":
-				address = withDefaultPort(address, "53")
-				_, err = net.ResolveUDPAddr("udp", address)
-				if err != nil {
-					return
-				}
-				var timeout time.Duration
-				timeout, err = parseTimeout(serverConfig, name)
-				if err != nil {
-					return
-				}
-				c := &dns.Client{Net: "udp", Timeout: timeout}
-				r = newResolver2(address, c, nil)
-			case "dns-over-tls":
-				address = withDefaultPort(address, "853")
-				var hostname string
-				if i, ok := serverConfig["hostname"]; !ok {
-					err = fmt.Errorf("Invalid config: hostname are required at resolver '%s'", name)
-					return
-				} else if hostname, ok = i.(string); !ok {
-					err = fmt.Errorf("Invalid config: hostname must be a string at resolver '%s'", name)
-					return
-				}
-				_, err = net.ResolveTCPAddr("tcp", address)
-				if err != nil {
-					return
-				}
-				var timeout time.Duration
-				timeout, err = parseTimeout(serverConfig, name)
-				if err != nil {
-					return
-				}
-				c := &dns.Client{Net: "tcp-tls", TLSConfig: &tls.Config{ServerName: hostname}, Timeout: timeout}
-				r = newResolver2(address, c, nil)
-			default:
-				err = fmt.Errorf("Invalid config: invalid mode at resolver '%s'", name)
-				return
-			}
-			resolvers = append(resolvers, r)
+			upstreams = append(upstreams, u)
 		}
-		namedResolvers[name] = resolvers
+		namedResolvers[name] = upstreams
 	}
 	return
 }
@@ -351,7 +265,7 @@ func parseTimeout(config map[interface{}]interface{}, name string) (dur time.Dur
 	return
 }
 
-func buildRoutes(routesConfig map[string][]ConfigRoute, namedResolvers map[string][]Resolver) (routes map[string]*questRouteTable, err error) {
+func buildRoutes(routesConfig map[string][]ConfigRoute, namedResolvers map[string][]upstream.Upstream) (routes map[string]*questRouteTable, err error) {
 	routes = make(map[string]*questRouteTable)
 	for name := range routesConfig {
 		routes[name] = &questRouteTable{routes: make([]*questRoute, 0), name: name}
@@ -366,7 +280,7 @@ func buildRoutes(routesConfig map[string][]ConfigRoute, namedResolvers map[strin
 				case "DOMAIN-SUFFIX":
 					r.rule = &questRuleDomainSuffix{suffix: fmt.Sprintf("%s.", param)}
 				case "ROUTE":
-					if r.resolvers != nil {
+					if r.upstreams != nil {
 						err = fmt.Errorf("Invalid config: connot use ROUTE and RESOLVER at same route")
 						return
 					}
@@ -384,8 +298,8 @@ func buildRoutes(routesConfig map[string][]ConfigRoute, namedResolvers map[strin
 						err = fmt.Errorf("Invalid config: connot use ROUTE and RESOLVER at same route")
 						return
 					}
-					if resolvers, ok := namedResolvers[param]; ok {
-						r.resolvers = resolvers
+					if upstreams, ok := namedResolvers[param]; ok {
+						r.upstreams = upstreams
 					} else {
 						err = fmt.Errorf("Invalid config: unknown resolver '%s'", param)
 						return
@@ -450,13 +364,13 @@ type questRouteTable struct {
 	routes []*questRoute
 }
 
-func (r *questRouteTable) Route(domain string) (resolvers []Resolver, cumulatedPostActions []questPostAction) {
+func (r *questRouteTable) Route(domain string) (upstreams []upstream.Upstream, cumulatedPostActions []questPostAction) {
 	cumulatedPostActions = make([]questPostAction, 0)
 	for _, route := range r.routes {
 		var postActions []questPostAction
-		resolvers, postActions = route.Route(domain)
+		upstreams, postActions = route.Route(domain)
 		cumulatedPostActions = append(cumulatedPostActions, postActions...)
-		if resolvers != nil {
+		if upstreams != nil {
 			return
 		}
 	}
@@ -467,10 +381,10 @@ type questRoute struct {
 	rule       questRule
 	table      *questRouteTable
 	postAction questPostAction
-	resolvers  []Resolver
+	upstreams  []upstream.Upstream
 }
 
-func (r *questRoute) Route(domain string) (resolvers []Resolver, cumulatedPostActions []questPostAction) {
+func (r *questRoute) Route(domain string) (upstreams []upstream.Upstream, cumulatedPostActions []questPostAction) {
 	cumulatedPostActions = make([]questPostAction, 0)
 	if r.rule.Match(domain) {
 		if r.postAction != nil {
@@ -478,12 +392,12 @@ func (r *questRoute) Route(domain string) (resolvers []Resolver, cumulatedPostAc
 		}
 		if r.table != nil {
 			var postActions []questPostAction
-			resolvers, postActions = r.table.Route(domain)
+			upstreams, postActions = r.table.Route(domain)
 			cumulatedPostActions = append(cumulatedPostActions, postActions...)
 			return
 		}
-		if r.resolvers != nil {
-			resolvers = r.resolvers
+		if r.upstreams != nil {
+			upstreams = r.upstreams
 			return
 		}
 	}
@@ -524,7 +438,7 @@ type ConfigServer struct {
 
 // ConfigResolver config struct
 type ConfigResolver struct {
-	Server []interface{} `yaml:"server"`
+	Server []string `yaml:"server"`
 }
 
 func readConfig(configPath string) (config *Config, err error) {
@@ -585,9 +499,8 @@ func withDefaultPort(address, defaultPort string) string {
 }
 
 type queryResult struct {
-	resolver   Resolver
-	msg        *dns.Msg
-	rtt        time.Duration
-	err        error
-	resolvedAt time.Time
+	resp *dns.Msg
+	err  error
+	u    upstream.Upstream
+	rtt  time.Duration
 }

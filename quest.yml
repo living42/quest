@@ -11,14 +11,14 @@ resolvers:
 
   non-china:
     server:
-      # - address: 8.8.8.8
-      #   mode: tcp
-      - address: 1.1.1.1
-        mode: dns-over-tls
-        hostname: cloudflare-dns.com
-      - address: 1.0.0.1
-        mode: dns-over-tls
-        hostname: cloudflare-dns.com
+      # - tcp://1.1.1.1
+      # - tcp://1.0.0.1
+      # - tls://1.1.1.1
+      # - tls://1.0.0.1
+      - https://1.1.1.1/dns-query
+      - https://1.0.0.1/dns-query
+      # - https://9.9.9.9:5053/dns-query
+      # - https://dns.google.com/resolve
 
 routes:
   main:
