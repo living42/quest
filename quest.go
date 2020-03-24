@@ -1,24 +1,21 @@
 package main
 
-/*
-	TODO resolver configuration (pooling, retry, timeout etc.)
-	TODO respond ahead of query
-*/
-
 import (
 	"bytes"
-	"context"
+	"container/list"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net"
+	"math"
+	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
-
-	tomb "gopkg.in/tomb.v2"
 
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/go-yaml/yaml"
@@ -26,328 +23,221 @@ import (
 )
 
 func main() {
-	configPath := flag.String("conf", "quest.yml", "configuration file")
+	confPath := flag.String("conf", "quest.yml", "configuration file")
 	flag.Parse()
-	server, err := newServer(*configPath)
+
+	conf, err := loadConfig(*confPath)
 	if err != nil {
-		fmt.Printf("err config: %s\n", err)
+		fmt.Println(err)
 		os.Exit(1)
 		return
 	}
-	log.SetFlags(log.LstdFlags)
 
-	err = server.Serve()
+	quest := Quest{conf: conf, cache: NewCache(conf.Server.CacheSize)}
+	err = quest.Run()
 	if err != nil {
-		fmt.Printf("err serve: %s\n", err)
-		os.Exit(2)
+		fmt.Println(err)
+		os.Exit(1)
 	}
 }
 
-type questServer struct {
-	listens []struct {
-		addr string
-		net  string
-	}
-	namedUpstreams map[string][]upstream.Upstream
-	routes         map[string]*questRouteTable
-
-	t       tomb.Tomb
-	servers []dns.Server
+type Quest struct {
+	conf      Config
+	upstreams map[string]upstream.Upstream
+	cache     *Cache
 }
 
-func newServer(configPath string) (server *questServer, err error) {
-	config, err := readConfig(configPath)
-	if err != nil {
-		return
-	}
-
-	listens, err := validateListens(config.Server.Listens)
-	if err != nil {
-		return
-	}
-
-	namedUpstreams, err := buildUpstreams(config.Resolvers)
-	if err != nil {
-		return
-	}
-
-	routes, err := buildRoutes(config.Routes, namedUpstreams)
-	if err != nil {
-		return
-	}
-
-	server = &questServer{
-		listens:        listens,
-		namedUpstreams: namedUpstreams,
-		routes:         routes,
-	}
-
-	return
+func msgKey(msg *dns.Msg) string {
+	q := msg.Question[0]
+	return q.String()
 }
 
-func (s *questServer) loaderExpireFunc(key interface{}) (interface{}, *time.Duration, error) {
-	// q := key.(dns.Question)
-	// result, err := s.query(q)
-	// if err != nil {
-	// 	return nil, nil, err
-	// }
-	// var ttl time.Duration
-	// if len(result.msg.Answer) == 0 {
-	// 	ttl = 5 * time.Second
-	// } else {
-	// 	a := result.msg.Answer[0]
-	// 	ttl = time.Duration(a.Header().Ttl) * time.Second
-	// 	for _, a = range result.msg.Answer {
-	// 		if a.Header().Rrtype == q.Qtype {
-	// 			ttl = time.Duration(a.Header().Ttl) * time.Second
-	// 			break
-	// 		}
-	// 	}
-	// }
-	// return result, &ttl, nil
-	panic("1")
-}
+var errNotRuleMatch = fmt.Errorf("not rule match with")
 
-func (s *questServer) Serve() error {
-	startServer := func(l struct{ addr, net string }) {
-		s.t.Go(func() error {
-			server := dns.Server{Net: l.net, Addr: l.addr, Handler: s}
-			errCh := make(chan error)
-			go func() {
-				log.Printf("serve on %s (%s)\n", l.addr, l.net)
-				errCh <- server.ListenAndServe()
-			}()
-
-			select {
-			case err := <-errCh:
-				return err
-			case <-s.t.Dying():
-				return nil
-			}
-		})
-	}
-
-	for _, l := range s.listens {
-		startServer(l)
-	}
-	return s.t.Wait()
-}
-
-func (s *questServer) Shutdown() error {
-	s.t.Kill(nil)
-	return s.t.Wait()
-}
-
-func (s *questServer) ServeDNS(w dns.ResponseWriter, m *dns.Msg) {
-	if len(m.Question) == 0 {
-		log.Printf("[%05d] empty query", m.Id)
-		return
-	}
-
+func (q *Quest) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	start := time.Now()
-	q := m.Question[0]
-	result, err := s.query(q)
-
-	var r *dns.Msg
-	if err != nil {
-		log.Printf("[%05d] %s %s query err %s", m.Id, q.Name, dns.Type(q.Qtype).String(), err)
-		r = m.Copy()
-		r.MsgHdr.Rcode = dns.RcodeServerFailure
-	} else {
-		r = result.resp.Copy()
-		r.Id = m.Id
-
-		question := m.Question[0]
-		rtt := time.Now().Sub(start)
-		log.Printf(
-			"[%05d] %s %s %s -> %s %s\n",
-			m.Id,
-			question.Name,
-			dns.Type(question.Qtype).String(),
-			w.RemoteAddr(),
-			result.u.Address(),
-			rtt.Round(time.Millisecond),
-		)
-	}
-
-	err = w.WriteMsg(r)
-	if err != nil {
-		log.Printf("[%05d] %s %s respond err %s", m.Id, q.Name, dns.Type(q.Qtype).String(), err)
-	}
-}
-
-func (s *questServer) query(q dns.Question) (*queryResult, error) {
-	ctx := context.Background()
-
-	upstreams, postActions := s.routes["main"].Route(q.Name)
-	if upstreams == nil {
-		err := fmt.Errorf("could not found a sutable resolver for this query")
-		return nil, err
-	}
-	m := &dns.Msg{}
-	m.Id = dns.Id()
-	m.Question = []dns.Question{q}
-	m.RecursionDesired = true
-
-	rc := make(chan *queryResult, 1)
-
-	go func() {
-		msgCopy := m.Copy()
-		msgCopy.Id = dns.Id()
-		start := time.Now()
-		resp, u, err := upstream.ExchangeParallel(upstreams, msgCopy)
-		if ctx.Err() != nil {
-			return
+	domain := req.Question[0].Name
+	resp, u, cached, _ := q.cache.GetOrCreate(req, func() (*dns.Msg, upstream.Upstream, error) {
+		rule, ok := q.findRule(domain)
+		if !ok {
+			log.Printf("W %s %s not rule match with\n", w.RemoteAddr(), req.Question[0].Name)
+			req.MsgHdr.Rcode = dns.RcodeServerFailure
+			w.WriteMsg(req)
+			return req, nil, errNotRuleMatch
 		}
-		rc <- &queryResult{
-			resp: resp,
-			err:  err,
-			u:    u,
-			rtt:  time.Since(start),
-		}
-	}()
-
-	var r *queryResult
-	select {
-	case r = <-rc:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	if r.err != nil {
-		return nil, r.err
-	}
-
-	resp := r.resp.Copy()
-	resp.Id = m.Id
-
-	for _, a := range postActions {
-		err := a.Do(resp)
-		if err != nil {
-			log.Printf("[%05d] failed to do action %T: %s\n", resp.Id, a, err)
-		}
-	}
-
-	return r, nil
-}
-
-func buildUpstreams(configs map[string]ConfigResolver) (namedResolvers map[string][]upstream.Upstream, err error) {
-	namedResolvers = make(map[string][]upstream.Upstream)
-
-	for name, config := range configs {
-		upstreams := make([]upstream.Upstream, 0)
-		for _, addr := range config.Server {
-			u, err := upstream.AddressToUpstream(addr, upstream.Options{Timeout: 120 * time.Second})
-			if err != nil {
-				panic(err)
-			}
+		upstreams := []upstream.Upstream{}
+		for _, addr := range rule.Resolvers {
+			u := q.upstreams[addr]
+			log.Printf("D %s %s -> %s\n", w.RemoteAddr(), domain, u.Address())
 			upstreams = append(upstreams, u)
 		}
-		namedResolvers[name] = upstreams
-	}
-	return
-}
-
-func parseTimeout(config map[interface{}]interface{}, name string) (dur time.Duration, err error) {
-	dur = 5 * time.Second
-	if i, ok := config["timeout"]; ok {
-		s, ok := i.(string)
-		if !ok {
-			err = fmt.Errorf("Invalid config: timeout must be a string at resolver '%s'", name)
-			return
-		}
-		dur, err = time.ParseDuration(s)
+		resp, u, err := upstream.ExchangeParallel(upstreams, req)
 		if err != nil {
-			err = fmt.Errorf("Invalid config: unknown timeout format (hints: 15s, 1m) at resolver '%s'", name)
-			return
-		}
-	}
-	return
-}
-
-func buildRoutes(routesConfig map[string][]ConfigRoute, namedResolvers map[string][]upstream.Upstream) (routes map[string]*questRouteTable, err error) {
-	routes = make(map[string]*questRouteTable)
-	for name := range routesConfig {
-		routes[name] = &questRouteTable{routes: make([]*questRoute, 0), name: name}
-	}
-	for name, routesDef := range routesConfig {
-		t := routes[name]
-
-		for _, routeDef := range routesDef {
-			r := &questRoute{rule: &questRuleAny{}}
-			for instruction, param := range routeDef {
-				switch strings.ToUpper(instruction) {
-				case "DOMAIN-SUFFIX":
-					r.rule = &questRuleDomainSuffix{suffix: fmt.Sprintf("%s.", param)}
-				case "ROUTE":
-					if r.upstreams != nil {
-						err = fmt.Errorf("Invalid config: connot use ROUTE and RESOLVER at same route")
-						return
+			log.Printf("E %s %s %s (%s)\n", w.RemoteAddr(), domain, err, u.Address())
+		} else {
+			if rule.IPSet != "" && hasIPSetCmd() {
+				for _, rr := range resp.Answer {
+					var ip string
+					switch rr := rr.(type) {
+					case *dns.A:
+						ip = rr.A.String()
+					case *dns.AAAA:
+						ip = rr.AAAA.String()
+					default:
+						continue
 					}
-					if param == name {
-						err = fmt.Errorf("Invalid config: cyclic routing in route table '%s'", name)
+					log.Printf("D %s %s +ipset add %s %s\n", w.RemoteAddr(), domain, rule.IPSet, ip)
+					err := ipsetAdd(rule.IPSet, ip)
+					if err != nil {
+						log.Printf("E %s %s ipset add: %s\n", w.RemoteAddr(), domain, err)
 					}
-					if table, ok := routes[param]; ok {
-						r.table = table
-					} else {
-						err = fmt.Errorf("Invalid config: unknown route table '%s'", param)
-						return
-					}
-				case "RESOLVER":
-					if r.table != nil {
-						err = fmt.Errorf("Invalid config: connot use ROUTE and RESOLVER at same route")
-						return
-					}
-					if upstreams, ok := namedResolvers[param]; ok {
-						r.upstreams = upstreams
-					} else {
-						err = fmt.Errorf("Invalid config: unknown resolver '%s'", param)
-						return
-					}
-				case "IPSET":
-					r.postAction = &ipsetAction{setName: param}
 				}
 			}
-			t.routes = append(t.routes, r)
+		}
+		return resp, u, err
+	})
+	duration := time.Now().Sub(start).Round(time.Millisecond)
+	if cached {
+		log.Printf("I %s %s <- %s %s (cached)\n", w.RemoteAddr(), domain, u.Address(), duration)
+	} else {
+		log.Printf("I %s %s <- %s %s\n", w.RemoteAddr(), domain, u.Address(), duration)
+	}
+	w.WriteMsg(resp)
+}
+
+func (q *Quest) findRule(domain string) (Rule, bool) {
+	for _, rule := range q.conf.Rules {
+		if len(rule.DomainSuffix) == 0 {
+			return rule, true
+		}
+		for _, suffix := range rule.DomainSuffix {
+			if strings.HasSuffix(domain, suffix) {
+				return rule, true
+			}
+		}
+	}
+	return Rule{}, false
+}
+
+func (q *Quest) Run() error {
+	log.Printf("I cahe size is %d\n", q.conf.Server.CacheSize)
+	q.upstreams = make(map[string]upstream.Upstream)
+	for _, rule := range q.conf.Rules {
+		for _, addr := range rule.Resolvers {
+			if _, ok := q.upstreams[addr]; ok {
+				continue
+			}
+			u, err := upstream.AddressToUpstream(addr, upstream.Options{Timeout: 15 * time.Second})
+			if err != nil {
+				return fmt.Errorf("failed to create upstream %s: %s", addr, err)
+			}
+			q.upstreams[addr] = u
 		}
 	}
 
-	if _, ok := routes["main"]; !ok {
-		err = fmt.Errorf("Invalid config: 'main' route are required")
-		return
-	}
-	return
-}
-
-type questPostAction interface {
-	Do(msg *dns.Msg) error
-}
-
-type ipsetAction struct {
-	setName string
-}
-
-func (a *ipsetAction) Do(msg *dns.Msg) error {
-	for _, answer := range msg.Answer {
-		var ip string
-		switch rr := answer.(type) {
-		case *dns.A:
-			ip = rr.A.String()
-		case *dns.AAAA:
-			ip = rr.AAAA.String()
-		default:
-			continue
-		}
-		err := a.ipsetAdd(ip)
+	errs := make(chan error, len(q.conf.Server.Listeners))
+	servers := make([]*dns.Server, 0, len(q.conf.Server.Listeners))
+	for _, addr := range q.conf.Server.Listeners {
+		u, err := url.Parse(addr)
 		if err != nil {
 			return err
 		}
+		s := &dns.Server{Net: u.Scheme, Addr: u.Host, Handler: q}
+		go func(s *dns.Server) {
+			log.Println("I listen on", fmt.Sprintf("%s://%s", s.Net, s.Addr))
+			err := s.ListenAndServe()
+			errs <- err
+		}(s)
+		go func(s *dns.Server) {
+			s.Shutdown()
+		}(s)
+		servers = append(servers, s)
 	}
-	return nil
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Reset(os.Interrupt, syscall.SIGTERM)
+	defer close(stop)
+	go func() {
+		sig := <-stop
+		log.Println("I shutdown by", sig)
+		for _, s := range servers {
+			s.Shutdown()
+		}
+	}()
+
+	var err error
+	for _ = range q.conf.Server.Listeners {
+		err = <-errs
+	}
+	return err
 }
 
-func (a *ipsetAction) ipsetAdd(ip string) error {
-	cmd := exec.Command("ipset", "add", a.setName, ip)
+type Rule struct {
+	DomainSuffix []string `yaml:"domain-suffix"`
+	Resolvers    []string `yaml:"resolvers"`
+	IPSet        string   `yaml:"ipset"`
+}
+
+type Config struct {
+	Server struct {
+		Listeners []string `yaml:"listeners"`
+		CacheSize int      `yaml:"cache-size"`
+	} `yaml:"server"`
+	Rules []Rule `yaml:"rules"`
+}
+
+func loadConfig(path string) (conf Config, err error) {
+	content, err := ioutil.ReadFile(path)
+	if err != nil {
+		err = fmt.Errorf("failed to load config: %s: %s", path, err)
+		return
+	}
+	err = yaml.Unmarshal(content, &conf)
+	if err != nil {
+		err = fmt.Errorf("failed to parse config: %s", err)
+		return
+	}
+
+	if len(conf.Server.Listeners) == 0 {
+		err = fmt.Errorf("config error: at least one listener are required")
+		return
+	}
+	if conf.Server.CacheSize <= 0 {
+		conf.Server.CacheSize = 1000
+	}
+
+	for _, rule := range conf.Rules {
+		if len(rule.Resolvers) == 0 {
+			err = fmt.Errorf("config err: every rule must has resolvers")
+			return
+		}
+		for i := range rule.DomainSuffix {
+			rule.DomainSuffix[i] = strings.TrimRight(rule.DomainSuffix[i], ".") + "."
+		}
+	}
+	return
+}
+
+var (
+	isIPSetCmd = 2
+)
+
+func hasIPSetCmd() bool {
+	if isIPSetCmd == 2 {
+		_, err := exec.Command("ipset", "version").CombinedOutput()
+		if err != nil {
+			log.Println("W ipset command not found")
+			isIPSetCmd = 0
+		} else {
+			isIPSetCmd = 1
+		}
+	}
+	return isIPSetCmd == 1
+}
+
+func ipsetAdd(setName, ip string) error {
+
+	cmd := exec.Command("ipset", "add", setName, ip)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if bytes.Contains(out, []byte("already added")) {
@@ -359,148 +249,90 @@ func (a *ipsetAction) ipsetAdd(ip string) error {
 	return nil
 }
 
-type questRouteTable struct {
-	name   string
-	routes []*questRoute
+type Cache struct {
+	mu        sync.Mutex
+	cacheSize int
+	items     map[string]*cacheItem
+	lru       *list.List
 }
 
-func (r *questRouteTable) Route(domain string) (upstreams []upstream.Upstream, cumulatedPostActions []questPostAction) {
-	cumulatedPostActions = make([]questPostAction, 0)
-	for _, route := range r.routes {
-		var postActions []questPostAction
-		upstreams, postActions = route.Route(domain)
-		cumulatedPostActions = append(cumulatedPostActions, postActions...)
-		if upstreams != nil {
-			return
-		}
-	}
-	return
+func NewCache(cacheSize int) *Cache {
+	return &Cache{cacheSize: cacheSize, items: make(map[string]*cacheItem), lru: list.New()}
 }
 
-type questRoute struct {
-	rule       questRule
-	table      *questRouteTable
-	postAction questPostAction
-	upstreams  []upstream.Upstream
-}
+func (c *Cache) GetOrCreate(req *dns.Msg, f func() (*dns.Msg, upstream.Upstream, error)) (*dns.Msg, upstream.Upstream, bool, error) {
+	key := msgKey(req)
+	c.mu.Lock()
+	item, ok := c.items[key]
 
-func (r *questRoute) Route(domain string) (upstreams []upstream.Upstream, cumulatedPostActions []questPostAction) {
-	cumulatedPostActions = make([]questPostAction, 0)
-	if r.rule.Match(domain) {
-		if r.postAction != nil {
-			cumulatedPostActions = append(cumulatedPostActions, r.postAction)
-		}
-		if r.table != nil {
-			var postActions []questPostAction
-			upstreams, postActions = r.table.Route(domain)
-			cumulatedPostActions = append(cumulatedPostActions, postActions...)
-			return
-		}
-		if r.upstreams != nil {
-			upstreams = r.upstreams
-			return
-		}
-	}
-	return
-}
-
-type questRule interface {
-	Match(domain string) bool
-}
-
-type questRuleDomainSuffix struct {
-	suffix string
-}
-
-func (r *questRuleDomainSuffix) Match(domain string) bool {
-	ok := strings.HasSuffix(strings.ToLower(domain), strings.ToLower(r.suffix))
-	return ok
-}
-
-type questRuleAny struct{}
-
-func (r *questRuleAny) Match(domain string) bool { return true }
-
-// Config config struct
-type Config struct {
-	Server    ConfigServer              `yaml:"server"`
-	Resolvers map[string]ConfigResolver `yaml:"resolvers"`
-	Routes    map[string][]ConfigRoute  `yaml:"routes"`
-}
-
-// ConfigRoute config struct
-type ConfigRoute map[string]string
-
-// ConfigServer config struct
-type ConfigServer struct {
-	Listens []map[string]string `yaml:"listens"`
-}
-
-// ConfigResolver config struct
-type ConfigResolver struct {
-	Server []string `yaml:"server"`
-}
-
-func readConfig(configPath string) (config *Config, err error) {
-	config = &Config{
-		Server: ConfigServer{
-			Listens: make([]map[string]string, 0),
-		},
-		Resolvers: make(map[string]ConfigResolver),
-		Routes:    make(map[string][]ConfigRoute),
-	}
-
-	var configData []byte
-	configData, err = ioutil.ReadFile(configPath)
-	if err != nil {
-		return
-	}
-
-	err = yaml.Unmarshal(configData, config)
-	if err != nil {
-		err = fmt.Errorf("Invalid config: %s", err)
-		return
-	}
-	return
-}
-
-func validateListens(listens []map[string]string) (out []struct{ addr, net string }, err error) {
-	out = make([]struct{ addr, net string }, 0, len(listens))
-	for i, l := range listens {
-		var proto, addr string
-		for proto, addr = range l {
-			proto = strings.ToLower(proto)
-			switch proto {
-			case "tcp", "udp":
-			default:
-				err = fmt.Errorf("Invalid config: invalid protocol in server.listen[%d], tcp or udp are expected", i)
-				return
+	// cache hit, but should expire, we remove it and resolve it again
+	if ok {
+		select {
+		case <-item.done:
+			if item.expiredAt.Before(time.Now()) {
+				remove := c.lru.Remove(item.lruRef).(string)
+				delete(c.items, remove)
+				ok = false
 			}
-			addr = withDefaultPort(addr, "53")
-			_, err = net.ResolveUDPAddr("udp", addr)
-			if err != nil {
-				err = fmt.Errorf("Invalid config: invalid address in server.listen[%d], %s", i, err)
-				return
+		default:
+		}
+	}
+
+	if !ok {
+		if len(c.items) >= c.cacheSize {
+			evicted := c.lru.Remove(c.lru.Back()).(string)
+			delete(c.items, evicted)
+		}
+		item = &cacheItem{
+			lruRef: c.lru.PushFront(key),
+			done:   make(chan error, 0),
+		}
+		c.items[key] = item
+		c.mu.Unlock()
+
+		item.msg, item.u, item.err = f()
+		if item.err != nil {
+			c.mu.Lock()
+			c.lru.Remove(item.lruRef)
+			delete(c.items, key)
+			c.mu.Unlock()
+		} else {
+			item.resolvedAt = time.Now()
+			var minTtl uint32 = math.MaxUint32
+			for _, rr := range item.msg.Answer {
+				if rr.Header().Ttl < minTtl {
+					minTtl = rr.Header().Ttl
+				}
 			}
-			break
+			item.expiredAt = item.resolvedAt.Add(time.Duration(minTtl) * time.Second)
 		}
 
-		out = append(out, struct{ addr, net string }{addr, proto})
+		close(item.done)
+		return item.msg, item.u, false, item.err
+	} else {
+		c.lru.MoveToFront(item.lruRef)
+		c.mu.Unlock()
+		msg, u, err := item.Get()
+		resp := msg.Copy()
+		for _, rr := range resp.Answer {
+			rr.Header().Ttl = rr.Header().Ttl - uint32(time.Now().Second()-item.resolvedAt.Second())
+		}
+		resp.Id = req.Id
+		return resp, u, true, err
 	}
-	return
 }
 
-func withDefaultPort(address, defaultPort string) string {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		host, port = address, defaultPort
-	}
-	return net.JoinHostPort(host, port)
+type cacheItem struct {
+	lruRef     *list.Element
+	done       chan error
+	msg        *dns.Msg
+	u          upstream.Upstream
+	err        error
+	resolvedAt time.Time
+	expiredAt  time.Time
 }
 
-type queryResult struct {
-	resp *dns.Msg
-	err  error
-	u    upstream.Upstream
-	rtt  time.Duration
+func (ci *cacheItem) Get() (*dns.Msg, upstream.Upstream, error) {
+	err := <-ci.done
+	return ci.msg, ci.u, err
 }

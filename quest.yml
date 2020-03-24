@@ -1,16 +1,247 @@
 server:
-  listens:
-    - TCP: :7053
-    - UDP: :7053
+  listeners:
+    - udp://:9053
+    - tcp://:9053
 
-resolvers:
-  china:
-    server:
+  # cache size in number of msgs
+  cache-size: 1000
+
+rules:
+  - resolvers:
       - 223.5.5.5
       - 223.6.6.6
+    ipset: ss_rules_dst_bypass_
+    domain-suffix:
+      - 126.net
+      - 127.net
+      - 163.com
+      - 360buyimg.com
+      - 51cdn.com
+      - aaplimg.com
+      - acgvideo.com
+      - aicdn.com
+      - aixifan.com
+      - akadns.net
+      - alibabacloud.com
+      - alicdn.com
+      - alikunlun.com
+      - alikunlun.net
+      - alipay.com
+      - aliyuncs.com
+      - aliyun.com
+      - amap.com
+      - analytics.126.net
+      - autonavi.com
+      - baidu.com
+      - baidu.com
+      - baiduyundns.com
+      - baiduyundns.net
+      - bcedns.com
+      - bcedns.net
+      - bdimg.com
+      - bdstatic.com
+      - bdydns.com
+      - bdydns.net
+      - bilibili.com
+      - bilibili.com
+      - blueit.com
+      - cachecn.com
+      - cachecn.net
+      - canyouseeme.org
+      - cc-1.com
+      - cc-cps.com
+      - cc-cps.mobi
+      - cc-cps.net
+      - ccbench.com
+      - ccgslb.com
+      - ccgslb.net
+      - ccmplus.net
+      - cdn2cdn.net
+      - cdnetworks.net
+      - cdngc.net
+      - cdnsvc.com
+      - cdnsvc.net
+      - cdnudns.com
+      - chinacache.com
+      - chinacache.net
+      - chinacache.org
+      - chinanetcenter.com
+      - clashroyaleapp.com
+      - cloudcdn.net
+      - clouddn.com
+      - cloudglb.com
+      - cloudglb.net
+      - cloudtcp.net
+      - cloudxns.com
+      - cloudxns.net
+      - cn
+      - cnbeta.com
+      - cnzz.com
+      - dl.google.com
+      - dnspao.com
+      - douban.com
+      - duokan.com
+      - ele.me
+      - elemecdn.com
+      - fastcdn.com
+      - fastwebcdn.com
+      - ffdns.net
+      - fsspace.com
+      - fwcdn.com
+      - fwcdn.net
+      - fwdns.net
+      - fwmob.com
+      - gccdn.net
+      - goodread.com
+      - gslbsvc.com
+      - gslbsvc.net
+      - gtimg.com
+      - hacdn.com
+      - hacdn.net
+      - hadns.net
+      - hao123.com
+      - haosou.com
+      - hd-cdn.com
+      - hdslb.com
+      - hdslb.net
+      - icloud-content.com
+      - icloud.com
+      - ifeng.com
+      - igslb.net
+      - intercomcdn.com
+      - iqiyi.com
+      - jd.com
+      - jdcdn.com
+      - jianshu.com
+      - jianshu.io
+      - jianshuapi.com
+      - kunlunaq.com
+      - kunlunar.com
+      - kunlunca.com
+      - kunluncan.com
+      - kunlunea.com
+      - kunlungem.com
+      - kunlungr.com
+      - kunlunhuf.com
+      - kunlunle.com
+      - kunlunli.com
+      - kunlunno.com
+      - kunlunpi.com
+      - kunlunra.com
+      - kunlunsa.com
+      - kunlunsc.com
+      - kunlunsl.com
+      - kunlunso.com
+      - kunlunta.com
+      - kunlunvi.com
+      - kunlunwe.com
+      - lxdns.com
+      - lxdns.net
+      - lxsvc.net
+      - meituan.net
+      - mi.com
+      - miaopai.com
+      - mincdn.com
+      - mirrordirector.raspbian.org
+      - mobike.com
+      - myqcloud.com
+      - myxns.org
+      - netease.com
+      - newdefend.com
+      - newdefend.net
+      - newdefend.org
+      - ourglb0.com
+      - outlook.com
+      - portchecker.co
+      - qbox.me
+      - pps.tv
+      - qcloud.com
+      - qhimg.com
+      - qingcloud.com
+      - qiniudn.com
+      - qiniudns.com
+      - qiyi.com
+      - qiyipic.com
+      - qpic.com
+      - qq.com
+      - ruguoapp.com
+      - shifen.com
+      - sogou.com
+      - sohu.com
+      - soso.com
+      - speedupchina.com
+      - speedupchina.net
+      - suning.com
+      - sz-dns.net
+      - t.tt
+      - taobao.com
+      - tcdn.qq.com
+      - tlgslb.com
+      - tmall.com
+      - tower.im
+      - tencentmind.com
+      - tudou.com
+      - umeng.com
+      - wangsu.com
+      - weather.com
+      - webluker.com
+      - weibo.com
+      - weiyun.com
+      - wscdns.com
+      - wsngb.com
+      - windows.com
+      - windowsupdate.com
+      - microsoft.com
+      - xgslb.net
+      - xiaomi.com
+      - xunlei.com
+      - ykimg.com
+      - youku.com
+      - yunjiasu-cdn.net
+      - zhihu.com
+      - zhimg.com
+      - jfrft.com
+      - abchina.com
+      - aliapp.com
+      - tbcache.com
+      - apple-dns.net
+      - meituan.net
+      - meituan.com
+      - dianping.com
+      - dpfile.com
+      - baifubao.com
+      - alipayobjects.com
+      - growingio.com
+      - cmbchina.com
+      - 95516.com
+      - netease.im
+      - 005.tv
+      - xiaoe-tech.com
+      - manong.io
+      - aixifan.com
+      - taptap.com
+      - dl-cdn.alpinelinux.org
+      - ss-hub.com
+      - ubuntu.com
+      - speedtest.net
+      - ksyungslb.com
+      - lncldglobal.com
+      - unity3d.com
+      - aliyuncs.com
+      - xindong.com
+      - txwy.tw
+      - tapdb.net
+      - app-measurement.com
+      - bearychat.com
+      - longfor.com
+      - mzstatic.com
+      - zdmimg.com
+      - smzdm.com
+      - aliapp.org
+      - ipip.net
 
-  non-china:
-    server:
+  # final rule. all request will go this route if it don't match any rule
+  - resolvers:
       # - tcp://1.1.1.1
       # - tcp://1.0.0.1
       # - tls://1.1.1.1
@@ -19,21 +250,3 @@ resolvers:
       - https://1.0.0.1/dns-query
       # - https://9.9.9.9:5053/dns-query
       # - https://dns.google.com/resolve
-
-routes:
-  main:
-    - {ROUTE: CHINA_SITES}
-    - {ROUTE: non-china}
-
-  CHINA_SITES:
-    - {DOMAIN-SUFFIX: cn, ROUTE: china}
-    - {DOMAIN-SUFFIX: baidu.com, ROUTE: china}
-    - {DOMAIN-SUFFIX: bilibili.com, ROUTE: china}
-    - {DOMAIN-SUFFIX: t.tt, ROUTE: china}
-
-  china:
-    - {IPSET: china}
-    - {RESOLVER: china}
-
-  non-china:
-    - {RESOLVER: non-china}
