@@ -263,6 +263,9 @@ func NewCache(cacheSize int) *Cache {
 func (c *Cache) GetOrCreate(req *dns.Msg, f func() (*dns.Msg, upstream.Upstream, error)) (*dns.Msg, upstream.Upstream, bool, error) {
 	key := msgKey(req)
 	c.mu.Lock()
+
+	c.expireLocked()
+
 	item, ok := c.items[key]
 
 	// cache hit, but should expire, we remove it and resolve it again
@@ -297,14 +300,13 @@ func (c *Cache) GetOrCreate(req *dns.Msg, f func() (*dns.Msg, upstream.Upstream,
 			delete(c.items, key)
 			c.mu.Unlock()
 		} else {
-			item.resolvedAt = time.Now()
 			var minTtl uint32 = math.MaxUint32
 			for _, rr := range item.msg.Answer {
 				if rr.Header().Ttl < minTtl {
 					minTtl = rr.Header().Ttl
 				}
 			}
-			item.expiredAt = item.resolvedAt.Add(time.Duration(minTtl) * time.Second)
+			item.expiredAt = time.Now().Add(time.Duration(minTtl) * time.Second)
 		}
 
 		close(item.done)
@@ -315,21 +317,38 @@ func (c *Cache) GetOrCreate(req *dns.Msg, f func() (*dns.Msg, upstream.Upstream,
 		msg, u, err := item.Get()
 		resp := msg.Copy()
 		for _, rr := range resp.Answer {
-			rr.Header().Ttl = rr.Header().Ttl - uint32(time.Now().Second()-item.resolvedAt.Second())
+			rr.Header().Ttl = uint32(time.Until(item.expiredAt).Seconds())
 		}
 		resp.Id = req.Id
 		return resp, u, true, err
 	}
 }
 
+func (c *Cache) expireLocked() {
+	now := time.Now()
+	for {
+		back := c.lru.Back()
+		if back == nil {
+			break
+		}
+		key := back.Value.(string)
+		item := c.items[key]
+		if item.expiredAt.Before(now) {
+			c.lru.Remove(back)
+			delete(c.items, key)
+		} else {
+			break
+		}
+	}
+}
+
 type cacheItem struct {
-	lruRef     *list.Element
-	done       chan error
-	msg        *dns.Msg
-	u          upstream.Upstream
-	err        error
-	resolvedAt time.Time
-	expiredAt  time.Time
+	lruRef    *list.Element
+	done      chan error
+	msg       *dns.Msg
+	u         upstream.Upstream
+	err       error
+	expiredAt time.Time
 }
 
 func (ci *cacheItem) Get() (*dns.Msg, upstream.Upstream, error) {
