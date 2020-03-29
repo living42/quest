@@ -57,7 +57,7 @@ var errNotRuleMatch = fmt.Errorf("not rule match with")
 func (q *Quest) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	start := time.Now()
 	domain := req.Question[0].Name
-	resp, u, cached, _ := q.cache.GetOrCreate(req, func() (*dns.Msg, upstream.Upstream, error) {
+	resp, u, cached, err := q.cache.GetOrCreate(req, func() (*dns.Msg, upstream.Upstream, error) {
 		rule, ok := q.findRule(domain)
 		if !ok {
 			log.Printf("W %s %s not rule match with\n", w.RemoteAddr(), req.Question[0].Name)
@@ -73,7 +73,9 @@ func (q *Quest) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		}
 		resp, u, err := upstream.ExchangeParallel(upstreams, req)
 		if err != nil {
-			log.Printf("E %s %s %s (%s)\n", w.RemoteAddr(), domain, err, u.Address())
+			log.Printf("E %s %s %s\n", w.RemoteAddr(), domain, err)
+			resp = req.Copy()
+			resp.Rcode = dns.RcodeServerFailure
 		} else {
 			if rule.IPSet != "" && hasIPSetCmd() {
 				for _, rr := range resp.Answer {
@@ -97,10 +99,12 @@ func (q *Quest) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return resp, u, err
 	})
 	duration := time.Now().Sub(start).Round(time.Millisecond)
-	if cached {
-		log.Printf("I %s %s <- %s %s (cached)\n", w.RemoteAddr(), domain, u.Address(), duration)
-	} else {
-		log.Printf("I %s %s <- %s %s\n", w.RemoteAddr(), domain, u.Address(), duration)
+	if err == nil {
+		if cached {
+			log.Printf("I %s %s <- %s %s (cached)\n", w.RemoteAddr(), domain, u.Address(), duration)
+		} else {
+			log.Printf("I %s %s <- %s %s\n", w.RemoteAddr(), domain, u.Address(), duration)
+		}
 	}
 	w.WriteMsg(resp)
 }
