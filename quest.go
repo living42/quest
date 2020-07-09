@@ -336,8 +336,8 @@ func (c *Cache) expireLocked() {
 			break
 		}
 		key := back.Value.(string)
-		item := c.items[key]
-		if item.expiredAt.Before(now) {
+		item, ok := c.items[key]
+		if ok && item.expiredAt.Before(now) {
 			c.lru.Remove(back)
 			delete(c.items, key)
 		} else {
