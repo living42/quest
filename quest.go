@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"container/list"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -43,7 +45,7 @@ func main() {
 
 type Quest struct {
 	conf      Config
-	upstreams map[string]upstream.Upstream
+	upstreams map[string]func() ([]upstream.Upstream, error)
 	cache     *Cache
 }
 
@@ -65,13 +67,18 @@ func (q *Quest) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			w.WriteMsg(req)
 			return req, nil, errNotRuleMatch
 		}
-		upstreams := []upstream.Upstream{}
+		allUpstreams := []upstream.Upstream{}
 		for _, addr := range rule.Resolvers {
-			u := q.upstreams[addr]
-			log.Printf("D %s %s -> %s\n", w.RemoteAddr(), domain, u.Address())
-			upstreams = append(upstreams, u)
+			upstreams, err := q.upstreams[addr]()
+			if err != nil {
+				return req, nil, err
+			}
+			for _, u := range upstreams {
+				log.Printf("D %s %s -> %s\n", w.RemoteAddr(), domain, u.Address())
+				allUpstreams = append(allUpstreams, u)
+			}
 		}
-		resp, u, err := upstream.ExchangeParallel(upstreams, req)
+		resp, u, err := upstream.ExchangeParallel(allUpstreams, req)
 		if err != nil {
 			log.Printf("E %s %s %s\n", w.RemoteAddr(), domain, err)
 			resp = req.Copy()
@@ -125,17 +132,28 @@ func (q *Quest) findRule(domain string) (Rule, bool) {
 
 func (q *Quest) Run() error {
 	log.Printf("I cahe size is %d\n", q.conf.Server.CacheSize)
-	q.upstreams = make(map[string]upstream.Upstream)
+	q.upstreams = make(map[string]func() ([]upstream.Upstream, error))
 	for _, rule := range q.conf.Rules {
 		for _, addr := range rule.Resolvers {
 			if _, ok := q.upstreams[addr]; ok {
 				continue
 			}
-			u, err := upstream.AddressToUpstream(addr, upstream.Options{Timeout: 15 * time.Second})
-			if err != nil {
-				return fmt.Errorf("failed to create upstream %s: %s", addr, err)
+			var f func() ([]upstream.Upstream, error)
+			if strings.HasPrefix(addr, "resolvconf://") {
+				location := strings.TrimPrefix(addr, "resolvconf://")
+				f = (&resolvconf{location: location}).GetUpstreams
+			} else {
+				u, err := upstream.AddressToUpstream(addr, upstream.Options{Timeout: 15 * time.Second})
+				if err != nil {
+					return fmt.Errorf("failed to create upstream %s: %s", addr, err)
+				}
+				f = func(u upstream.Upstream) func() ([]upstream.Upstream, error) {
+					return func() ([]upstream.Upstream, error) {
+						return []upstream.Upstream{u}, nil
+					}
+				}(u)
 			}
-			q.upstreams[addr] = u
+			q.upstreams[addr] = f
 		}
 	}
 
@@ -358,4 +376,55 @@ type cacheItem struct {
 func (ci *cacheItem) Get() (*dns.Msg, upstream.Upstream, error) {
 	err := <-ci.done
 	return ci.msg, ci.u, err
+}
+
+type resolvconf struct {
+	location   string
+	upstreams  []upstream.Upstream
+	lastModify time.Time
+}
+
+var nsRegex = regexp.MustCompile(`nameserver\s+([\w.:]+)`)
+
+func (r *resolvconf) GetUpstreams() ([]upstream.Upstream, error) {
+	stat, err := os.Stat(r.location)
+	if err != nil {
+		return nil, err
+	}
+	if r.lastModify.Before(stat.ModTime()) {
+		content, err := ioutil.ReadFile(r.location)
+		if err != nil {
+			return nil, err
+		}
+		text := removeComments(string(content))
+
+		var upstreams []upstream.Upstream
+		for _, match := range nsRegex.FindAllStringSubmatch(text, -1) {
+			addr := match[1]
+			u, err := upstream.AddressToUpstream(addr, upstream.Options{Timeout: 15 * time.Second})
+			if err != nil {
+				return nil, err
+			}
+			upstreams = append(upstreams, u)
+		}
+		r.upstreams = upstreams
+	}
+
+	if len(r.upstreams) == 0 {
+		return nil, errors.New("no upstream found in file://" + r.location)
+	}
+
+	return r.upstreams, nil
+}
+
+func removeComments(content string) string {
+	lines := strings.Split(content, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		commentIdx := strings.Index(line, "#")
+		if commentIdx > -1 {
+			lines[0] = line[:commentIdx]
+		}
+	}
+	return strings.Join(lines, "\n")
 }

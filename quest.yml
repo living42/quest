@@ -8,8 +8,7 @@ server:
 
 rules:
   - resolvers:
-      - 223.5.5.5
-      - 223.6.6.6
+      - resolvconf://resolv.conf
     ipset: ss_rules_dst_bypass_
     domain-suffix:
       - 126.net
