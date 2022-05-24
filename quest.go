@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"math"
 	"net/url"
 	"os"
 	"os/exec"
@@ -283,67 +282,8 @@ func NewCache(cacheSize int) *Cache {
 }
 
 func (c *Cache) GetOrCreate(req *dns.Msg, f func() (*dns.Msg, upstream.Upstream, error)) (*dns.Msg, upstream.Upstream, bool, error) {
-	key := msgKey(req)
-	c.mu.Lock()
-
-	c.expireLocked()
-
-	item, ok := c.items[key]
-
-	// cache hit, but should expire, we remove it and resolve it again
-	if ok {
-		select {
-		case <-item.done:
-			if item.expiredAt.Before(time.Now()) {
-				remove := c.lru.Remove(item.lruRef).(string)
-				delete(c.items, remove)
-				ok = false
-			}
-		default:
-		}
-	}
-
-	if !ok {
-		if len(c.items) >= c.cacheSize {
-			evicted := c.lru.Remove(c.lru.Back()).(string)
-			delete(c.items, evicted)
-		}
-		item = &cacheItem{
-			lruRef: c.lru.PushFront(key),
-			done:   make(chan error, 0),
-		}
-		c.items[key] = item
-		c.mu.Unlock()
-
-		item.msg, item.u, item.err = f()
-		if item.err != nil {
-			c.mu.Lock()
-			c.lru.Remove(item.lruRef)
-			delete(c.items, key)
-			c.mu.Unlock()
-		} else {
-			var minTtl uint32 = math.MaxUint32
-			for _, rr := range item.msg.Answer {
-				if rr.Header().Ttl < minTtl {
-					minTtl = rr.Header().Ttl
-				}
-			}
-			item.expiredAt = time.Now().Add(time.Duration(minTtl) * time.Second)
-		}
-
-		close(item.done)
-		return item.msg, item.u, false, item.err
-	} else {
-		c.lru.MoveToFront(item.lruRef)
-		c.mu.Unlock()
-		msg, u, err := item.Get()
-		resp := msg.Copy()
-		for _, rr := range resp.Answer {
-			rr.Header().Ttl = uint32(time.Until(item.expiredAt).Seconds())
-		}
-		resp.Id = req.Id
-		return resp, u, true, err
-	}
+	msg, u, err := f()
+	return msg, u, false, err
 }
 
 func (c *Cache) expireLocked() {
